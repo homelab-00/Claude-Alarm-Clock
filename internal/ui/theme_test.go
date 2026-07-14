@@ -14,11 +14,34 @@ import (
 func TestThemeFallsThroughForUnhandledNames(t *testing.T) {
 	th := NewTheme()
 
+	for _, name := range []fyne.ThemeColorName{
+		theme.ColorNameError,
+		theme.ColorNameDisabled,
+		theme.ColorNameHover,
+	} {
+		got := th.Color(name, theme.VariantDark)
+		want := theme.DefaultTheme().Color(name, theme.VariantDark)
+
+		if got != want {
+			t.Fatalf("Color(%v) = %v, want the default %v", name, got, want)
+		}
+	}
+}
+
+// The accent colour is deliberately overridden to match the app's tray icon
+// (see colAccent in theme.go), not left to Fyne's default primary.
+func TestThemeOverridesPrimaryWithAccent(t *testing.T) {
+	th := NewTheme()
+
 	got := th.Color(theme.ColorNamePrimary, theme.VariantDark)
-	want := theme.DefaultTheme().Color(theme.ColorNamePrimary, theme.VariantDark)
+	want := color.NRGBA{R: 0x4C, G: 0x8D, B: 0xFF, A: 0xFF}
 
 	if got != want {
-		t.Fatalf("Color(primary) = %v, want the default %v", got, want)
+		t.Fatalf("Color(primary) = %v, want the accent %v", got, want)
+	}
+
+	if def := theme.DefaultTheme().Color(theme.ColorNamePrimary, theme.VariantDark); got == def {
+		t.Fatalf("Color(primary) = %v, matches Fyne's default primary %v; the accent override is not taking effect", got, def)
 	}
 }
 
@@ -71,8 +94,17 @@ func TestThemeDefinesAClockSize(t *testing.T) {
 		t.Fatalf("Size(clock) = %v, want something large enough to be a clock face", got)
 	}
 	// And unknown sizes fall through.
-	if got, want := th.Size(theme.SizeNamePadding), theme.DefaultTheme().Size(theme.SizeNamePadding); got != want {
-		t.Fatalf("Size(padding) = %v, want the default %v", got, want)
+	if got, want := th.Size(theme.SizeNameText), theme.DefaultTheme().Size(theme.SizeNameText); got != want {
+		t.Fatalf("Size(text) = %v, want the default %v", got, want)
+	}
+}
+
+// Padding is deliberately overridden to 8, not left to Fyne's default.
+func TestThemeOverridesPadding(t *testing.T) {
+	th := NewTheme()
+
+	if got := th.Size(theme.SizeNamePadding); got != 8 {
+		t.Fatalf("Size(padding) = %v, want 8", got)
 	}
 }
 
