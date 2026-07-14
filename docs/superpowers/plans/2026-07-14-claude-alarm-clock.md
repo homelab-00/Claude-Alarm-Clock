@@ -2008,6 +2008,16 @@ sleep 300
 printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"x","total_cost_usd":0,"duration_ms":1}\n' "$(pwd)"
 ```
 
+`internal/runner/testdata/echoargs.sh` — returns its own argv as the answer text, so a test can assert that `BuildArgs`'s output actually reaches `exec`:
+
+```sh
+#!/bin/sh
+# Escape backslashes then double quotes, so the argv survives being embedded in
+# a JSON string.
+ESCAPED=$(printf '%s' "$*" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"x","total_cost_usd":0,"duration_ms":1}\n' "$ESCAPED"
+```
+
 Make them executable:
 
 ```bash
@@ -2160,17 +2170,24 @@ func TestCLIRunSetsWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestCLIRunPassesTheBuiltArgs(t *testing.T) {
-	// ok.sh echoes its args to stderr; we cannot see stderr on success, so
-	// assert instead that BuildArgs is what gets handed to exec by checking a
-	// flag-sensitive script. Simplest: assert Run succeeds and BuildArgs is
-	// covered by args_test.go. Here we just guard the wiring.
-	got, err := NewCLI().Run(context.Background(), cfg(t, "ok.sh"))
+// BuildArgs is unit-tested in args_test.go, but that proves nothing about
+// whether those args actually reach exec. echoargs.sh returns its own argv as
+// the answer text, so this asserts the whole wiring end to end.
+func TestCLIRunActuallyPassesTheBuiltArgsToTheProcess(t *testing.T) {
+	got, err := NewCLI().Run(context.Background(), cfg(t, "echoargs.sh"))
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if got.Text == "" {
-		t.Fatal("no text returned; the wiring is broken")
+
+	for _, want := range []string{"-p", "--model haiku", "--output-format json", "--safe-mode", "Hello world"} {
+		if !strings.Contains(got.Text, want) {
+			t.Fatalf("the process did not receive %q; it got: %s", want, got.Text)
+		}
+	}
+	for _, banned := range []string{"--dangerously-skip-permissions", "--bare"} {
+		if strings.Contains(got.Text, banned) {
+			t.Fatalf("the process received the banned flag %q: %s", banned, got.Text)
+		}
 	}
 }
 
@@ -3427,11 +3444,11 @@ func (c *Core) Arm(st config.State) error {
 	if err := st.ValidateWorkDir(); err != nil {
 		return err
 	}
-	bin, err := runner.Lookup()
-	if err != nil {
+	// Resolve claude now, at arm time, so a missing binary fails while the user
+	// is looking at the app -- not at fire time, when nobody is.
+	if _, err := runner.Lookup(); err != nil {
 		return err
 	}
-	_ = bin // resolved at arm time so the failure surfaces while the user is watching
 
 	now := c.clk.Now()
 	fire, target, err := st.Spec.FireAt(now)
@@ -4603,35 +4620,53 @@ func TestInstallTrayIsANoOpWithoutADesktopApp(t *testing.T) {
 	}
 }
 
+// fakeWindow records what KeepAliveOnClose does to a window.
+//
+// KeepAliveOnClose takes the narrow closableWindow interface rather than
+// fyne.Window precisely so this is possible: fyne.Window is a large interface
+// with no way to read the close intercept back, which would leave the single
+// most load-bearing line in the app untestable.
+type fakeWindow struct {
+	intercept func()
+	hidden    bool
+	closed    bool
+}
+
+func (f *fakeWindow) SetCloseIntercept(fn func()) { f.intercept = fn }
+func (f *fakeWindow) Hide()                       { f.hidden = true }
+func (f *fakeWindow) Close()                      { f.closed = true }
+
 // The close intercept is the single thing keeping the process alive when the
-// user clicks X. Fyne's destroyWindow() quits the app when the last window
-// closes, with no system-tray exception.
-func TestKeepAliveOnCloseHidesRatherThanQuits(t *testing.T) {
-	test.NewApp()
-	w := test.NewWindow(nil)
-	defer w.Close()
+// user clicks X: Fyne's destroyWindow() quits the app when the last window
+// closes, with NO system-tray exception. This test invokes the registered
+// intercept and asserts it hides rather than closes.
+func TestKeepAliveOnCloseHidesRatherThanClosing(t *testing.T) {
+	f := &fakeWindow{}
 
-	w.Show()
-	KeepAliveOnClose(w)
+	KeepAliveOnClose(f)
 
-	// Fyne stores the intercept; invoking it must hide, not close.
-	if w.(interface{ Hidden() bool }) == nil {
-		t.Skip("test window does not expose Hidden()")
+	if f.intercept == nil {
+		t.Fatal("KeepAliveOnClose registered no close intercept; clicking X would kill the app")
+	}
+
+	f.intercept() // the user clicks X
+
+	if !f.hidden {
+		t.Fatal("the close intercept must Hide the window")
+	}
+	if f.closed {
+		t.Fatal("the close intercept must NOT Close the window: Close destroys it, and Fyne quits when the last window is destroyed")
 	}
 }
 
-func TestKeepAliveOnCloseSetsAnIntercept(t *testing.T) {
+// fyne.Window must still satisfy the narrow interface, or main.go will not
+// compile.
+func TestFyneWindowSatisfiesClosableWindow(t *testing.T) {
 	test.NewApp()
 	w := test.NewWindow(nil)
 	defer w.Close()
 
-	KeepAliveOnClose(w)
-
-	// There is no public getter for the intercept, so we assert the observable
-	// contract instead: the helper must not panic and must leave the window
-	// usable. The real behaviour is verified manually (MANUAL-TESTS.md item 3),
-	// because it depends on the window manager delivering a close event.
-	w.Resize(fyne.NewSize(100, 100))
+	var _ closableWindow = w
 }
 ```
 
@@ -4703,6 +4738,17 @@ func InstallTray(a fyne.App, w fyne.Window, core *app.Core, icon fyne.Resource) 
 	return true
 }
 
+// closableWindow is the slice of fyne.Window that KeepAliveOnClose needs.
+//
+// Narrowed deliberately: fyne.Window is a large interface with no way to read
+// the close intercept back, so taking it whole would leave the single most
+// load-bearing line in the app impossible to test. fyne.Window satisfies this.
+type closableWindow interface {
+	SetCloseIntercept(func())
+	Hide()
+	Close()
+}
+
 // KeepAliveOnClose makes the window's close button hide it instead of
 // destroying it.
 //
@@ -4713,7 +4759,7 @@ func InstallTray(a fyne.App, w fyne.Window, core *app.Core, icon fyne.Resource) 
 //
 // Corollary: never call w.Close() anywhere in app code. Close bypasses the
 // intercept entirely.
-func KeepAliveOnClose(w fyne.Window) {
+func KeepAliveOnClose(w closableWindow) {
 	w.SetCloseIntercept(func() { w.Hide() })
 }
 ```
