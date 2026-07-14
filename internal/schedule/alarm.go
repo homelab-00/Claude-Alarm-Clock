@@ -92,6 +92,15 @@ type Alarm struct {
 	target time.Time
 	grace  time.Duration
 
+	// stale is set the instant a clock jump is detected, and cleared only by
+	// Arm (a freshly-computed fire time is by definition current) or Disarm.
+	// While stale is true, the loop must not evaluate Decide against fireAt:
+	// the jump has just proven that instant untrustworthy, and only a fresh
+	// Arm -- never the mere passage of ticks -- can make it trustworthy
+	// again. See the jump-handling block in Run for why this must be
+	// structural rather than left to whichever goroutine wins a race.
+	stale bool
+
 	// beforeDisarm, if set, is called by Run immediately after it decides to
 	// fire or report an alarm missed, but before it attempts to clear the
 	// pending alarm. Production code never sets it, so it costs one nil
@@ -133,6 +142,11 @@ func NewAlarm(clk Clock, period time.Duration, newTicker TickerFunc) *Alarm {
 func (a *Alarm) Updates() <-chan Update { return a.out }
 
 // Arm schedules a fire at fireAt. It replaces any pending alarm.
+//
+// It clears stale: a fireAt computed just now, by definition, has not been
+// invalidated by any jump this process has seen yet. This is what lets the
+// loop resume acting on it -- and it is the only thing that may, since a
+// jump is what set stale in the first place.
 func (a *Alarm) Arm(fireAt, target time.Time, grace time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -140,6 +154,7 @@ func (a *Alarm) Arm(fireAt, target time.Time, grace time.Duration) {
 	a.fireAt = fireAt.Round(0)
 	a.target = target.Round(0)
 	a.grace = grace
+	a.stale = false
 }
 
 // Disarm cancels any pending alarm. The loop keeps ticking.
@@ -149,6 +164,7 @@ func (a *Alarm) Disarm() {
 	a.armed = false
 	a.fireAt = time.Time{}
 	a.target = time.Time{}
+	a.stale = false
 }
 
 // Armed reports the current armed state and the pending times.
@@ -185,15 +201,41 @@ func (a *Alarm) Run(ctx context.Context) {
 			mono := a.clk.Mono()
 
 			if jump, jumped := DetectJump(now.Sub(lastWall), mono-lastMono, a.period); jumped {
+				lastWall, lastMono = now, mono
+				a.markStale()
 				if !a.emit(ctx, Update{Kind: EventJump, Now: now, Jump: jump}) {
 					return
 				}
+				// fireAt, if any, is exactly what the jump just invalidated.
+				// Acting on it this tick -- firing, missing, or even just
+				// judging it against `now` -- would race whatever recompute
+				// the jump's observer (Core) is about to perform from the
+				// Spec. Skip straight to the next tick and wait for a fresh
+				// Arm instead of Decide-ing here; see the stale field's doc
+				// comment on why this must be unconditional rather than
+				// racing Core's reaction.
+				continue
 			}
 			lastWall, lastMono = now, mono
 
-			armed, fireAt, target, grace := a.snapshot()
+			armed, fireAt, target, grace, stale := a.snapshot()
 			if !armed {
 				if !a.emit(ctx, Update{Kind: EventTick, Now: now}) {
+					return
+				}
+				continue
+			}
+			if stale {
+				// A previous tick saw a jump and this one has not yet been
+				// re-Armed with a fresh fire time. Keep the UI clock moving,
+				// but do not Decide: fireAt is still the pre-jump value, and
+				// it stays untrustworthy no matter how many ticks pass --
+				// only Arm (or Disarm) can clear stale.
+				if !a.emit(ctx, Update{
+					Kind: EventTick, Now: now,
+					FireAt: fireAt, Target: target,
+					Remaining: fireAt.Sub(now),
+				}) {
 					return
 				}
 				continue
@@ -249,10 +291,21 @@ func (a *Alarm) Run(ctx context.Context) {
 	}
 }
 
-func (a *Alarm) snapshot() (bool, time.Time, time.Time, time.Duration) {
+func (a *Alarm) snapshot() (armed bool, fireAt, target time.Time, grace time.Duration, stale bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.armed, a.fireAt, a.target, a.grace
+	return a.armed, a.fireAt, a.target, a.grace, a.stale
+}
+
+// markStale flags the pending fire time, if any, as invalidated by a clock
+// jump. It is unconditional -- even a disarmed alarm gets marked, which
+// costs nothing (the disarmed path never reads stale) and avoids a branch
+// for "was it armed at the moment of the jump", which is itself racy against
+// a concurrent Arm.
+func (a *Alarm) markStale() {
+	a.mu.Lock()
+	a.stale = true
+	a.mu.Unlock()
 }
 
 // disarmIfStill clears the pending alarm only if fireAt is still the instant

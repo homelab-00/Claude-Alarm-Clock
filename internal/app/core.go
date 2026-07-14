@@ -72,6 +72,7 @@ type Core struct {
 	mu     sync.Mutex
 	state  config.State
 	status Status
+	ctx    context.Context // set by Run; bounds the blocking terminal-event sends below
 }
 
 // New returns a Core. Call Run in a goroutine, and run the Alarm too.
@@ -181,7 +182,7 @@ func (c *Core) Restore() error {
 	case schedule.DecideMissed:
 		c.disarmAndPersist()
 		c.setStatus(StatusMissed)
-		c.emit(Event{
+		c.emitBlocking(Event{
 			Status: StatusMissed, Now: now,
 			FireAt: st.FireAt, Target: st.Target,
 			Late: now.Round(0).Sub(st.FireAt.Round(0)),
@@ -219,6 +220,10 @@ func (c *Core) RunNow() {
 
 // Run consumes the alarm's updates. It blocks until ctx is cancelled.
 func (c *Core) Run(ctx context.Context) {
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -250,7 +255,7 @@ func (c *Core) Run(ctx context.Context) {
 			case schedule.EventMissed:
 				c.disarmAndPersist()
 				c.setStatus(StatusMissed)
-				c.emit(Event{
+				c.emitBlocking(Event{
 					Status: StatusMissed, Now: u.Now,
 					FireAt: u.FireAt, Target: u.Target, Late: u.Late,
 				})
@@ -266,7 +271,7 @@ func (c *Core) fire(ctx context.Context, fireAt, target time.Time) {
 	bin, err := runner.Lookup()
 	if err != nil {
 		c.setStatus(StatusError)
-		c.emit(Event{Status: StatusError, Now: c.clk.Now(), Err: err})
+		c.emitBlocking(Event{Status: StatusError, Now: c.clk.Now(), Err: err})
 		return
 	}
 
@@ -283,12 +288,12 @@ func (c *Core) fire(ctx context.Context, fireAt, target time.Time) {
 	})
 	if err != nil {
 		c.setStatus(StatusError)
-		c.emit(Event{Status: StatusError, Now: c.clk.Now(), FireAt: fireAt, Target: target, Err: err})
+		c.emitBlocking(Event{Status: StatusError, Now: c.clk.Now(), FireAt: fireAt, Target: target, Err: err})
 		return
 	}
 
 	c.setStatus(StatusDone)
-	c.emit(Event{Status: StatusDone, Now: c.clk.Now(), FireAt: fireAt, Target: target, Result: res})
+	c.emitBlocking(Event{Status: StatusDone, Now: c.clk.Now(), FireAt: fireAt, Target: target, Result: res})
 }
 
 // recomputeAfterJump re-derives the fire time from the Spec after the wall clock
@@ -302,6 +307,21 @@ func (c *Core) recomputeAfterJump(now time.Time) {
 	st := c.State()
 	fire, target, err := st.Spec.FireAt(now)
 	if err != nil {
+		// The Spec itself is no longer computable (e.g. its IANA zone
+		// vanished from the system tzdata between arming and now). The live
+		// alarm is armed-but-stale at this point -- per Alarm.Run's stale
+		// handling, simply returning here would leave it stuck that way
+		// forever: stale is cleared only by Arm or Disarm, and this
+		// recompute was its one chance at a fresh Arm. Disarm explicitly,
+		// persist that, and tell the user -- silence here is how an alarm
+		// disappears.
+		c.alarm.Disarm()
+		c.disarmAndPersist()
+		c.setStatus(StatusError)
+		c.emitBlocking(Event{
+			Status: StatusError, Now: now,
+			Err: fmt.Errorf("recompute fire time after clock jump: %w", err),
+		})
 		return
 	}
 
@@ -342,4 +362,40 @@ func (c *Core) emit(e Event) {
 	case c.out <- e:
 	default:
 	}
+}
+
+// emitBlocking sends a terminal event (StatusDone, StatusError, StatusMissed)
+// and waits for room in the channel if there isn't any.
+//
+// Dropping a tick costs nothing -- another follows in a second. Dropping a
+// terminal event costs the user the only record of it: config.State has no
+// field for a runner.Result, so a dropped StatusDone silently discards the
+// answer the alarm ran for, with no way to recover it. So these three
+// statuses block instead of dropping.
+//
+// The wait is bounded by Core's own context, not by the caller's: a wedged
+// UI must eventually be freed by process shutdown (ctx cancelled), but it
+// must not be able to free itself early by, say, cancelling the fire's own
+// per-run context while the result is still in flight. If Run has not been
+// called yet -- ctx is nil -- there is nothing to bound the wait with and
+// nothing that could ever cancel it, so we fall back to the non-blocking
+// send rather than risk hanging forever.
+func (c *Core) emitBlocking(e Event) {
+	ctx := c.runContext()
+	if ctx == nil {
+		c.emit(e)
+		return
+	}
+	select {
+	case c.out <- e:
+	case <-ctx.Done():
+	}
+}
+
+// runContext returns the context Run was started with, or nil if Run has not
+// been called yet.
+func (c *Core) runContext() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ctx
 }

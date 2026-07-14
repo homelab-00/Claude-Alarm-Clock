@@ -56,6 +56,19 @@ func (r *rig) step(d time.Duration) []Event {
 	}
 }
 
+// drain discards any events already buffered on the Core's channel, so a
+// later step's collected events reflect only what happens from that point
+// on.
+func (r *rig) drain() {
+	for {
+		select {
+		case <-r.core.Events():
+		default:
+			return
+		}
+	}
+}
+
 func (r *rig) armed(spec schedule.Spec) config.State {
 	r.t.Helper()
 	st := r.store.MustLoad()
@@ -321,23 +334,105 @@ func TestCoreArmRejectsAnInvalidState(t *testing.T) {
 	}
 }
 
-// A time jump must cause the pending fire time to be recomputed from the Spec,
-// not left as a stale absolute instant.
+// A time jump must cause the pending fire time to be recomputed from the
+// Spec, not acted on as a stale absolute instant.
+//
+// The jump crosses a day boundary: armed for 23:00 on 07-14, then a 20h
+// suspend carries the wall clock to 03:00 on 07-15. The STALE fire time
+// (23:00 07-14) is now ~4h in the past -- far beyond the 5-minute grace --
+// so an alarm that acts on it without recomputing would wrongly conclude
+// MISSED. The correct behaviour is to re-derive the fire time from the Spec,
+// landing on 23:00 of the NEW day, and stay armed and quiet.
+//
+// This is deliberately NOT the same shape as a same-day jump (e.g. 2h
+// backwards within the same day): that leaves the "next occurrence of
+// 23:00" unchanged, so a no-op recompute reaches the same conclusion as a
+// working one and the test cannot discriminate between them. Crossing
+// midnight changes which occurrence is next, so only a genuine recompute
+// lands on the right answer.
 func TestCoreRecomputesFireTimeAfterATimeJump(t *testing.T) {
 	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
 	r := newRig(t, start)
 
 	r.armed(schedule.Spec{Hour: 23, Minute: 0, Offset: 0, Grace: 5 * time.Minute})
+	r.drain() // discard the StatusArmed event from arming; isolate the jump's effect
 
-	// Jump backwards two hours -- an NTP correction. The alarm is still for
-	// 23:00 today, so it must still be pending and must not have fired.
-	r.clk.Set(start.Add(-2 * time.Hour))
+	// The laptop lid closes. Wall clock jumps forward 20h -- past midnight --
+	// while the monotonic clock does not move: a real suspend, per
+	// TestClock.Suspend's contract.
+	r.clk.Suspend(20 * time.Hour)
 	got := r.step(0)
 
 	if r.fake.CallCount() != 0 {
-		t.Fatal("claude ran after a backwards clock step")
+		t.Fatalf("claude ran %d times; a stale-but-recomputed alarm must not fire", r.fake.CallCount())
 	}
-	if !hasStatus(got, StatusArmed) {
-		t.Fatalf("want it still armed after a clock step, got %v", got)
+	if hasStatus(got, StatusMissed) {
+		t.Fatalf("reported MISSED off the stale pre-jump fire time instead of recomputing: %v", got)
+	}
+
+	wantFireAt := time.Date(2026, 7, 15, 23, 0, 0, 0, time.Local)
+
+	armed, fireAt, _ := r.core.alarm.Armed()
+	if !armed {
+		t.Fatal("live alarm disarmed after the jump; the recompute must keep it pending")
+	}
+	if !fireAt.Equal(wantFireAt) {
+		t.Fatalf("live FireAt = %v, want %v (23:00 on the NEW day)", fireAt, wantFireAt)
+	}
+
+	// This is the assertion that catches the state divergence: the live
+	// alarm and the persisted state must agree. If Core's EventMissed
+	// handling raced ahead of (or behind) the recompute's own Arm(), the
+	// live alarm can end up armed while the persisted copy is left
+	// Armed=false -- silently losing the alarm on the next restart.
+	st := r.store.MustLoad()
+	if !st.Armed {
+		t.Fatal("persisted state Armed = false after the jump; STATE DIVERGED from the live alarm")
+	}
+	if !st.FireAt.Equal(wantFireAt) {
+		t.Fatalf("persisted FireAt = %v, want %v (23:00 on the NEW day)", st.FireAt, wantFireAt)
+	}
+}
+
+// A full Events channel must not silently drop a terminal status the way it
+// drops a tick. StatusDone carries the only copy of the runner's Result --
+// config.State has no field for one -- so losing it to a full buffer is
+// unrecoverable; the user would never see the answer their alarm ran for.
+//
+// This fills the buffered channel to capacity directly (same package: out is
+// unexported), fires the alarm, and confirms StatusDone still arrives once
+// draining resumes. A non-blocking (dropping) implementation would have
+// discarded it the instant it landed on the already-full buffer, and this
+// test would time out.
+func TestCoreTerminalEventIsNotDroppedWhenTheChannelIsFull(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
+	r := newRig(t, start)
+
+	r.armed(schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute})
+	r.drain() // discard the StatusArmed event from arming
+
+	// Fill the buffered channel to capacity without anybody draining it.
+	for i := 0; i < cap(r.core.out); i++ {
+		r.core.out <- Event{Status: StatusArmed}
+	}
+
+	// Fire the alarm. StatusRunning may legitimately drop (it is not
+	// terminal), but StatusDone must block for room rather than vanish.
+	r.clk.Advance(10 * time.Minute)
+	r.tick.Tick()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case e := <-r.core.Events():
+			if e.Status == StatusDone {
+				if r.fake.CallCount() != 1 {
+					t.Fatalf("claude ran %d times, want 1", r.fake.CallCount())
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("StatusDone never arrived after the channel had room; it was dropped")
+		}
 	}
 }

@@ -136,13 +136,28 @@ func TestAlarmCountsDownThenFires(t *testing.T) {
 // THE test. This is the one that would have caught the monotonic-clock bug.
 //
 // The machine suspends for 12h30m across the fire time. On resume the alarm is
-// hours stale, so it must report MISSED -- not fire, and not fire late.
+// hours stale, so it must eventually report MISSED -- not fire, and not fire
+// late.
+//
+// This is a two-phase test, not the original single-tick one: the fix for
+// the EventJump/recompute race (see stale in alarm.go) means the very tick
+// that detects a jump must NOT also Decide on the fire time the jump just
+// invalidated -- that stale fire time is exactly what raced Core's recompute
+// in production and corrupted persisted state. So phase 1 asserts the jump
+// tick reports the jump and ONLY the jump, leaving the alarm armed and
+// waiting. Phase 2 simulates Core's reaction -- recompute from the Spec, then
+// re-Arm -- which in this scenario is a no-op (this fire time isn't derived
+// from a repeating schedule the jump could roll to a new day, so the
+// recomputed value is the same instant) and asserts the grace/missed
+// judgment fires correctly once re-Armed.
 func TestAlarmSuspendPastGraceReportsMissedAndDoesNotFire(t *testing.T) {
 	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.UTC)
 	h := newHarness(t, start)
 
 	fire := start.Add(10 * time.Minute)
-	h.alarm.Arm(fire, fire.Add(20*time.Minute), 5*time.Minute)
+	target := fire.Add(20 * time.Minute)
+	grace := 5 * time.Minute
+	h.alarm.Arm(fire, target, grace)
 
 	// The laptop lid closes. One tick later, 12h30m of wall clock has passed
 	// but the monotonic clock has not moved at all -- a real suspend.
@@ -151,8 +166,21 @@ func TestAlarmSuspendPastGraceReportsMissedAndDoesNotFire(t *testing.T) {
 	if !hasKind(got, EventJump) {
 		t.Fatalf("kinds = %v, want a jump event", kinds(got))
 	}
+	if hasKind(got, EventMissed) || hasKind(got, EventFire) {
+		t.Fatalf("acted on the pre-jump fire time on the jump tick itself: kinds = %v", kinds(got))
+	}
+	if armed, _, _ := h.alarm.Armed(); !armed {
+		t.Fatal("alarm disarmed itself on the jump tick; it must stay armed, waiting for a re-Arm")
+	}
+
+	// Simulate Core's reaction to EventJump: recompute from the Spec and
+	// re-Arm. Here that recompute is a no-op (see comment above), so
+	// re-Arming with the same instant is exactly what it would produce.
+	h.alarm.Arm(fire, target, grace)
+
+	got = h.step(0)
 	if !hasKind(got, EventMissed) {
-		t.Fatalf("kinds = %v, want a missed event", kinds(got))
+		t.Fatalf("kinds = %v, want a missed event once re-Armed with the (still stale) fire time", kinds(got))
 	}
 	if hasKind(got, EventFire) {
 		t.Fatalf("alarm FIRED after a 12h30m suspend; it must not: kinds = %v", kinds(got))
@@ -173,16 +201,33 @@ func TestAlarmSuspendPastGraceReportsMissedAndDoesNotFire(t *testing.T) {
 }
 
 // A short suspend that lands inside the grace window must still fire.
+//
+// Two-phase for the same reason as TestAlarmSuspendPastGraceReportsMissedAndDoesNotFire
+// above: the jump tick itself must only report the jump, then a simulated
+// Core re-Arm (a no-op here, same reasoning as above) unsticks it so the
+// grace judgment can run.
 func TestAlarmSuspendWithinGraceStillFires(t *testing.T) {
 	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.UTC)
 	h := newHarness(t, start)
 
 	fire := start.Add(1 * time.Minute)
-	h.alarm.Arm(fire, fire.Add(20*time.Minute), 5*time.Minute)
+	target := fire.Add(20 * time.Minute)
+	grace := 5 * time.Minute
+	h.alarm.Arm(fire, target, grace)
 
 	// Suspend for 4 minutes: 3 minutes past the fire time, inside a 5m grace.
 	got := h.stepSuspend(4 * time.Minute)
 
+	if !hasKind(got, EventJump) {
+		t.Fatalf("kinds = %v, want a jump event", kinds(got))
+	}
+	if hasKind(got, EventFire) || hasKind(got, EventMissed) {
+		t.Fatalf("acted on the pre-jump fire time on the jump tick itself: kinds = %v", kinds(got))
+	}
+
+	h.alarm.Arm(fire, target, grace) // simulate Core's (no-op, here) recompute + re-Arm
+
+	got = h.step(0)
 	if !hasKind(got, EventFire) {
 		t.Fatalf("kinds = %v, want a fire (3m late is inside a 5m grace)", kinds(got))
 	}
@@ -281,10 +326,20 @@ func TestAlarmRunStopsOnContextCancel(t *testing.T) {
 
 // -- Supplementary coverage tests below this line --
 //
-// Everything above this point is the verbatim brief test suite and must not
-// be altered. These two are additions, in scope only because they cover
-// alarm.go code this task introduces (EventKind.String, and emit's
-// ctx-cancellation path) that the verbatim suite does not happen to reach.
+// Everything above this point was originally the verbatim brief test suite.
+// That held until the EventJump/stale fix (see the `stale` field in
+// alarm.go): TestAlarmSuspendPastGraceReportsMissedAndDoesNotFire and
+// TestAlarmSuspendWithinGraceStillFires each asserted a jump and its
+// Missed/Fire judgment within a single tick, which the fix makes
+// structurally impossible -- the jump tick may now only report EventJump,
+// never Decide on the fire time it just invalidated. Both were rewritten to
+// the same two-phase shape the fix requires (jump tick, then a simulated
+// Core re-Arm, then the judgment) while preserving their original
+// assertions; see their doc comments for the detail. Everything else above
+// this point is still the unmodified original. These two below are
+// additions, in scope only because they cover alarm.go code this task
+// introduces (EventKind.String, and emit's ctx-cancellation path) that the
+// original suite does not happen to reach.
 
 // TestAlarmRearmDuringFireIsNotClobbered reproduces the TOCTOU lost-update
 // race: Run reads state (snapshot), releases the lock, calls the pure
