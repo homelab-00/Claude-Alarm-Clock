@@ -232,11 +232,13 @@ func (c *Core) Run(ctx context.Context) {
 		case u := <-c.alarm.Updates():
 			switch u.Kind {
 			case schedule.EventJump:
-				// The wall clock moved behind our back. Every derived fire time
-				// is now suspect -- recompute it from the Spec, which is the
-				// only thing that survives a suspend, an NTP step, a DST change,
-				// or a timezone change.
-				c.recomputeAfterJump(u.Now)
+				// The wall clock moved behind our back (suspend, or an NTP
+				// step). This is purely informational: fireAt is an absolute
+				// instant and is unaffected by the jump, so Alarm.Run already
+				// evaluates Decide against it correctly on this same tick
+				// (fire within grace, MISSED beyond it, handled below via
+				// EventFire/EventMissed). Core must not mutate the alarm here
+				// -- see the design doc §5.2/§5.3 and the correction therein.
 
 			case schedule.EventTick:
 				if armed, _, _ := c.alarm.Armed(); armed {
@@ -294,44 +296,6 @@ func (c *Core) fire(ctx context.Context, fireAt, target time.Time) {
 
 	c.setStatus(StatusDone)
 	c.emitBlocking(Event{Status: StatusDone, Now: c.clk.Now(), FireAt: fireAt, Target: target, Result: res})
-}
-
-// recomputeAfterJump re-derives the fire time from the Spec after the wall clock
-// moved. The Spec is the only durable truth; an absolute instant is not.
-func (c *Core) recomputeAfterJump(now time.Time) {
-	armed, _, _ := c.alarm.Armed()
-	if !armed {
-		return
-	}
-
-	st := c.State()
-	fire, target, err := st.Spec.FireAt(now)
-	if err != nil {
-		// The Spec itself is no longer computable (e.g. its IANA zone
-		// vanished from the system tzdata between arming and now). The live
-		// alarm is armed-but-stale at this point -- per Alarm.Run's stale
-		// handling, simply returning here would leave it stuck that way
-		// forever: stale is cleared only by Arm or Disarm, and this
-		// recompute was its one chance at a fresh Arm. Disarm explicitly,
-		// persist that, and tell the user -- silence here is how an alarm
-		// disappears.
-		c.alarm.Disarm()
-		c.disarmAndPersist()
-		c.setStatus(StatusError)
-		c.emitBlocking(Event{
-			Status: StatusError, Now: now,
-			Err: fmt.Errorf("recompute fire time after clock jump: %w", err),
-		})
-		return
-	}
-
-	st.FireAt, st.Target = fire, target
-	c.mu.Lock()
-	c.state = st
-	c.mu.Unlock()
-	_ = c.store.Save(st)
-
-	c.alarm.Arm(fire, target, st.Spec.Grace)
 }
 
 func (c *Core) disarmAndPersist() {

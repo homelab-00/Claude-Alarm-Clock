@@ -334,63 +334,55 @@ func TestCoreArmRejectsAnInvalidState(t *testing.T) {
 	}
 }
 
-// A time jump must cause the pending fire time to be recomputed from the
-// Spec, not acted on as a stale absolute instant.
+// The alarm is one-shot and never silently reschedules itself (spec §2). A
+// suspend that carries the wall clock past the fire time -- even past
+// midnight -- must be reported MISSED, not silently re-armed for the next
+// occurrence.
 //
-// The jump crosses a day boundary: armed for 23:00 on 07-14, then a 20h
-// suspend carries the wall clock to 03:00 on 07-15. The STALE fire time
-// (23:00 07-14) is now ~4h in the past -- far beyond the 5-minute grace --
-// so an alarm that acts on it without recomputing would wrongly conclude
-// MISSED. The correct behaviour is to re-derive the fire time from the Spec,
-// landing on 23:00 of the NEW day, and stay armed and quiet.
-//
-// This is deliberately NOT the same shape as a same-day jump (e.g. 2h
-// backwards within the same day): that leaves the "next occurrence of
-// 23:00" unchanged, so a no-op recompute reaches the same conclusion as a
-// working one and the test cannot discriminate between them. Crossing
-// midnight changes which occurrence is next, so only a genuine recompute
-// lands on the right answer.
-func TestCoreRecomputesFireTimeAfterATimeJump(t *testing.T) {
+// The user arms a 23:00 target, then the laptop lid closes for ~20h,
+// carrying the wall clock from 07:00 on 07-14 to past 03:00 on 07-15 -- well
+// past both the fire time and the 5-minute grace. EventJump is purely
+// informational (design doc §5.2/§5.3): Core must not recompute or re-arm
+// off it. The correct outcome is MISSED, claude never runs, the alarm is
+// disarmed (live and persisted), and -- the key assertion -- it must NOT
+// have been silently re-armed for 23:00 the next day.
+func TestCoreSuspendPastMidnightReportsMissedAndDoesNotReschedule(t *testing.T) {
 	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
 	r := newRig(t, start)
 
 	r.armed(schedule.Spec{Hour: 23, Minute: 0, Offset: 0, Grace: 5 * time.Minute})
 	r.drain() // discard the StatusArmed event from arming; isolate the jump's effect
 
-	// The laptop lid closes. Wall clock jumps forward 20h -- past midnight --
-	// while the monotonic clock does not move: a real suspend, per
-	// TestClock.Suspend's contract.
+	// The laptop lid closes. Wall clock jumps forward 20h -- past midnight and
+	// well past the 23:00 fire time -- while the monotonic clock does not
+	// move: a real suspend, per TestClock.Suspend's contract.
 	r.clk.Suspend(20 * time.Hour)
 	got := r.step(0)
 
+	if !hasStatus(got, StatusMissed) {
+		t.Fatalf("want StatusMissed after a suspend that carries past the fire time, got %v", got)
+	}
 	if r.fake.CallCount() != 0 {
-		t.Fatalf("claude ran %d times; a stale-but-recomputed alarm must not fire", r.fake.CallCount())
+		t.Fatalf("claude ran %d times; a missed alarm must not run", r.fake.CallCount())
 	}
-	if hasStatus(got, StatusMissed) {
-		t.Fatalf("reported MISSED off the stale pre-jump fire time instead of recomputing: %v", got)
-	}
-
-	wantFireAt := time.Date(2026, 7, 15, 23, 0, 0, 0, time.Local)
 
 	armed, fireAt, _ := r.core.alarm.Armed()
-	if !armed {
-		t.Fatal("live alarm disarmed after the jump; the recompute must keep it pending")
-	}
-	if !fireAt.Equal(wantFireAt) {
-		t.Fatalf("live FireAt = %v, want %v (23:00 on the NEW day)", fireAt, wantFireAt)
+	if armed {
+		t.Fatalf("live alarm still armed after MISSED; want disarmed, got fireAt=%v", fireAt)
 	}
 
-	// This is the assertion that catches the state divergence: the live
-	// alarm and the persisted state must agree. If Core's EventMissed
-	// handling raced ahead of (or behind) the recompute's own Arm(), the
-	// live alarm can end up armed while the persisted copy is left
-	// Armed=false -- silently losing the alarm on the next restart.
 	st := r.store.MustLoad()
-	if !st.Armed {
-		t.Fatal("persisted state Armed = false after the jump; STATE DIVERGED from the live alarm")
+	if st.Armed {
+		t.Fatal("persisted state Armed = true after MISSED; want disarmed")
 	}
-	if !st.FireAt.Equal(wantFireAt) {
-		t.Fatalf("persisted FireAt = %v, want %v (23:00 on the NEW day)", st.FireAt, wantFireAt)
+
+	// The key assertion: no silent re-arm for tomorrow's 23:00.
+	notWant := time.Date(2026, 7, 15, 23, 0, 0, 0, time.Local)
+	if fireAt.Equal(notWant) {
+		t.Fatalf("alarm was silently re-armed for the next day's 23:00 (%v) instead of being reported missed", notWant)
+	}
+	if st.FireAt.Equal(notWant) {
+		t.Fatalf("persisted state was silently re-armed for the next day's 23:00 (%v) instead of being reported missed", notWant)
 	}
 }
 
