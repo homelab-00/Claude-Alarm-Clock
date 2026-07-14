@@ -15,19 +15,6 @@ const (
 	DecideMissed
 )
 
-func (d Decision) String() string {
-	switch d {
-	case DecideWait:
-		return "wait"
-	case DecideFire:
-		return "fire"
-	case DecideMissed:
-		return "missed"
-	default:
-		return "unknown"
-	}
-}
-
 // Decide is the whole firing policy, as a pure function.
 //
 // Round(0) strips the monotonic reading from BOTH operands before comparing

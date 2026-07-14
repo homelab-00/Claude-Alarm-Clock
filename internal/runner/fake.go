@@ -57,10 +57,3 @@ func (f *Fake) LastCall() (Config, bool) {
 	}
 	return f.calls[len(f.calls)-1], true
 }
-
-// Calls returns a copy of every Config Run was given.
-func (f *Fake) Calls() []Config {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]Config(nil), f.calls...)
-}

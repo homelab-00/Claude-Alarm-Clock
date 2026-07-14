@@ -74,20 +74,44 @@ func TestCLIRunBadModelIsAnErrorDespiteSubtypeSayingSuccess(t *testing.T) {
 // output is exactly what the user needs to see -- the alarm just failed
 // unattended. Both is_error error messages (with and without
 // api_error_status) must surface it, along with the exit code.
+//
+// claude.go has two separate is_error branches -- one for
+// env.APIErrorStatus != nil, one for == nil -- each formatting its own
+// fmt.Errorf call with stderrSuffix/exitDesc. Exercising only the
+// api_error_status fixture, as this test previously did despite its doc
+// comment's claim, left the other branch free to drop stderr and the exit
+// code with the whole suite still green. Both fixtures here carry
+// is_error:true, stderr, and a non-zero exit; they differ only in whether
+// api_error_status is present, which is what selects the branch.
 func TestCLIRunIsErrorSurfacesStderrAndExitCode(t *testing.T) {
-	_, err := NewCLI().Run(context.Background(), cfg(t, "bad_model_stderr.sh"))
-	if err == nil {
-		t.Fatal("Run() error = nil; is_error:true must not be reported as success")
-	}
-	if !strings.Contains(err.Error(), "404") {
-		t.Fatalf("error should surface the API status: %v", err)
-	}
-	if !strings.Contains(err.Error(), "node:internal warning") {
-		t.Fatalf("error should surface stderr: %v", err)
-	}
-	if !strings.Contains(err.Error(), "exit 1") {
-		t.Fatalf("error should surface the exit code: %v", err)
-	}
+	t.Run("with api_error_status", func(t *testing.T) {
+		_, err := NewCLI().Run(context.Background(), cfg(t, "bad_model_stderr.sh"))
+		if err == nil {
+			t.Fatal("Run() error = nil; is_error:true must not be reported as success")
+		}
+		if !strings.Contains(err.Error(), "404") {
+			t.Fatalf("error should surface the API status: %v", err)
+		}
+		if !strings.Contains(err.Error(), "node:internal warning") {
+			t.Fatalf("error should surface stderr: %v", err)
+		}
+		if !strings.Contains(err.Error(), "exit 1") {
+			t.Fatalf("error should surface the exit code: %v", err)
+		}
+	})
+
+	t.Run("without api_error_status", func(t *testing.T) {
+		_, err := NewCLI().Run(context.Background(), cfg(t, "bad_result_stderr.sh"))
+		if err == nil {
+			t.Fatal("Run() error = nil; is_error:true must not be reported as success")
+		}
+		if !strings.Contains(err.Error(), "node:internal warning") {
+			t.Fatalf("error should surface stderr: %v", err)
+		}
+		if !strings.Contains(err.Error(), "exit 1") {
+			t.Fatalf("error should surface the exit code: %v", err)
+		}
+	})
 }
 
 // A network failure makes the real CLI hang forever, with no output and no
