@@ -2,12 +2,14 @@ package ui
 
 import (
 	"errors"
+	"image/color"
 	"strings"
 	"testing"
 	"time"
 
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/theme"
 
 	"claudealarm/internal/app"
 	"claudealarm/internal/config"
@@ -679,5 +681,59 @@ func TestFormatCountdown(t *testing.T) {
 		if got := formatCountdown(c.in); got != c.want {
 			t.Errorf("formatCountdown(%v) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// After a run settles, the explainer must stop promising a FUTURE run. Reading
+// "Claude Code will run at 07:25" directly beneath "Done · $0.0044" is
+// confusing: it describes a hypothetical re-arm, not what just happened.
+func TestWindowExplainerStopsPromisingAFutureRunOnceSettled(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
+	if !strings.Contains(w.explainer.Text, "will run") {
+		t.Fatalf("idle explainer = %q, want it to promise a future run", w.explainer.Text)
+	}
+
+	w.Apply(app.Event{
+		Status: app.StatusDone,
+		Now:    time.Now(),
+		Result: runner.Result{Text: "Hello!", CostUSD: 0.0044, Duration: 3 * time.Second},
+	})
+
+	if strings.Contains(w.explainer.Text, "will run") {
+		t.Fatalf("explainer after Done = %q; it must not still promise a future run", w.explainer.Text)
+	}
+	if !strings.Contains(w.explainer.Text, "Arm again") {
+		t.Fatalf("explainer after Done = %q, want it to invite a re-arm", w.explainer.Text)
+	}
+
+	// And it goes back to the future tense once re-armed.
+	w.Apply(app.Event{
+		Status: app.StatusArmed, Now: time.Now(),
+		FireAt: time.Now().Add(time.Hour), Target: time.Now().Add(90 * time.Minute),
+		Remaining: time.Hour,
+	})
+	if strings.Contains(w.explainer.Text, "Arm again") {
+		t.Fatalf("explainer while armed = %q; the re-arm invitation must be gone", w.explainer.Text)
+	}
+}
+
+// canvas.Text captures its colour when constructed. If the hero kept that
+// stale colour, a window built before the theme was installed would render its
+// largest element invisible -- the same trap the Card widget exists to avoid
+// with canvas.Rectangle's FillColor. The hero must re-read the theme on every
+// refresh.
+func TestWindowHeroRereadsItsColourOnRefresh(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.hero.Color = color.NRGBA{R: 1, G: 2, B: 3, A: 4} // a colour no theme returns
+
+	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
+
+	want := theme.Color(theme.ColorNameForeground)
+	if w.hero.Color != want {
+		t.Fatalf("hero colour = %v after refresh, want the theme's foreground %v; "+
+			"a stale colour renders the app's largest element invisible", w.hero.Color, want)
 	}
 }

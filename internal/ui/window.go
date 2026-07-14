@@ -54,8 +54,16 @@ type Window struct {
 	modelEntry  *widget.Entry
 	promptEntry *widget.Entry
 
-	armBtn    *widget.Button
-	armed     bool // drives onArm's branch; armBtn.Text is presentational only
+	armBtn *widget.Button
+	armed  bool // drives onArm's branch; armBtn.Text is presentational only
+
+	// settled is true once a run has finished one way or another (Done, Missed
+	// or Error). It only changes the explainer's wording: a settled window
+	// describes a hypothetical re-arm ("Arm again to run at 07:25") rather than
+	// promising a future run ("Claude Code will run at 07:25"), which reads as
+	// confused sitting directly under "Done · $0.0044".
+	settled bool
+
 	runNowBtn *widget.Button
 	buttons   *fyne.Container
 	advanced  *widget.Accordion
@@ -254,6 +262,13 @@ func (w *Window) Apply(e app.Event) {
 
 	w.runNowBtn.Hide()
 
+	// A run that has finished one way or another changes only the explainer's
+	// wording -- see the settled field. setArmButton calls
+	// refreshHeroAndExplainer, so this must be set before the switch runs.
+	w.settled = e.Status == app.StatusDone ||
+		e.Status == app.StatusMissed ||
+		e.Status == app.StatusError
+
 	switch e.Status {
 	case app.StatusIdle:
 		w.status.SetText("Idle")
@@ -346,6 +361,14 @@ func (w *Window) setArmButton(armed bool) {
 // entries' OnChanged handlers (so the sentence updates live as the user
 // types).
 func (w *Window) refreshHeroAndExplainer() {
+	// canvas.Text captures its colour when constructed, so re-read it on every
+	// refresh. Without this the hero renders in whatever colour was current at
+	// NewWindow time -- and if the theme is installed after the window is built
+	// (reverse two lines in main.go and it is), that colour is the wrong one, so
+	// the app's largest element silently renders invisible. Same trap the Card
+	// widget exists to avoid with canvas.Rectangle's FillColor.
+	w.hero.Color = theme.Color(theme.ColorNameForeground)
+
 	if w.armed {
 		w.hero.Text = formatCountdown(w.armedRemaining)
 		w.explainer.SetText(armedExplainer(w.armedFireAt, w.armedTarget))
@@ -362,7 +385,15 @@ func (w *Window) refreshHeroAndExplainer() {
 	}
 
 	w.hero.Text = fire.Format("15:04")
-	w.explainer.SetText(idleExplainer(fire, target, offset))
+
+	// After a run has finished (or been missed, or failed), "Claude Code WILL
+	// run at 07:25" sitting directly under "Done · $0.0044" reads as confused --
+	// it is describing a hypothetical re-arm, not what just happened. Say so.
+	if w.settled {
+		w.explainer.SetText(rearmExplainer(fire, target, offset))
+	} else {
+		w.explainer.SetText(idleExplainer(fire, target, offset))
+	}
 	w.hero.Refresh()
 }
 
@@ -406,6 +437,19 @@ func idleExplainer(fire, target time.Time, offset time.Duration) string {
 	}
 	return fmt.Sprintf("Claude Code will run at %s — %d min before your %s target (in %s)",
 		fire.Format("15:04"), int(offset/time.Minute), target.Format("15:04"), in)
+}
+
+// rearmExplainer is the sentence shown once a run has settled (Done, Missed, or
+// Error). idleExplainer's future tense -- "Claude Code WILL run at 07:25" --
+// reads as confused directly beneath "Done · $0.0044", because it is describing
+// a hypothetical re-arm rather than the run that just happened. This says which.
+func rearmExplainer(fire, target time.Time, offset time.Duration) string {
+	if offset <= 0 {
+		return fmt.Sprintf("Arm again to run at %s, exactly at your target.",
+			fire.Format("15:04"))
+	}
+	return fmt.Sprintf("Arm again to run at %s — %d min before your %s target.",
+		fire.Format("15:04"), int(offset/time.Minute), target.Format("15:04"))
 }
 
 // armedExplainer is the plain-language sentence while Armed. Unlike
