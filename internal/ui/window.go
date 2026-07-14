@@ -8,7 +8,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/validation"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -38,6 +37,7 @@ type Window struct {
 
 	armBtn    *widget.Button
 	runNowBtn *widget.Button
+	buttons   *fyne.Container
 
 	content fyne.CanvasObject
 }
@@ -64,7 +64,13 @@ func NewWindow(core *app.Core) *Window {
 	w.timeEntry.SetText(fmt.Sprintf("%02d:%02d", st.Spec.Hour, st.Spec.Minute))
 	// Fyne has no time picker, and neither does fyne-x. An alarm is a typing
 	// interaction anyway: you type 07:30 and press enter.
-	w.timeEntry.Validator = validation.NewTime("15:04")
+	//
+	// This must be schedule.ParseHHMM, not validation.NewTime("15:04"): Go's
+	// "15" verb is variable-width, so time.Parse alone accepts "7:30". If the
+	// entry's validator were looser than ParseHHMM, the field would show
+	// "7:30" as valid and then Arm would reject it -- two validators
+	// disagreeing about the same input.
+	w.timeEntry.Validator = timeValidator
 
 	w.offsetEntry = widget.NewEntry()
 	w.offsetEntry.SetPlaceHolder("minutes")
@@ -117,7 +123,13 @@ func (w *Window) build() fyne.CanvasObject {
 		)),
 	)
 
-	buttons := container.NewGridWithColumns(2, w.armBtn, w.runNowBtn)
+	// Run now is hidden except in StatusMissed. A GridWithColumns would keep
+	// reserving its cell even while hidden, leaving Arm stuck at half width;
+	// Border only allocates space to runNowBtn while it is Visible(), so Arm
+	// fills the row whenever Run now is not shown. Apply refreshes this
+	// container whenever runNowBtn's visibility changes, so the layout is
+	// recomputed rather than left stale from construction.
+	w.buttons = container.NewBorder(nil, nil, nil, w.runNowBtn, w.armBtn)
 
 	resultCard := NewCard(container.NewVScroll(w.result))
 	resultCard.Resize(fyne.NewSize(0, 140))
@@ -125,7 +137,7 @@ func (w *Window) build() fyne.CanvasObject {
 	return container.NewPadded(container.NewVBox(
 		clockCard,
 		form,
-		buttons,
+		w.buttons,
 		advanced,
 		resultCard,
 	))
@@ -180,6 +192,11 @@ func (w *Window) Apply(e app.Event) {
 		w.status.SetText("Error · " + e.Err.Error())
 		w.setArmButton("Arm", widget.HighImportance)
 	}
+
+	// Hide/Show only refresh the button itself, not the Border container that
+	// lays it out, so the row must be told to recompute -- otherwise Arm stays
+	// sized as if Run now were still occupying its half of the row.
+	w.buttons.Refresh()
 }
 
 func (w *Window) setArmButton(label string, imp widget.Importance) {
@@ -248,6 +265,14 @@ func (w *Window) fail(err error) {
 	if w.win != nil {
 		dialog.ShowError(err, w.win)
 	}
+}
+
+// timeValidator is the single source of truth for the target-time entry: it
+// is the exact same parser stateFromForm uses to arm the alarm, so the field
+// never shows "valid" for input that Arm will then reject.
+func timeValidator(s string) error {
+	_, _, err := schedule.ParseHHMM(s)
+	return err
 }
 
 func minutesValidator(s string) error {

@@ -39,6 +39,10 @@ func NewTheme() *Theme { return &Theme{} }
 
 var _ fyne.Theme = (*Theme)(nil)
 
+// Color ignores the variant parameter and always renders the dark palette
+// above. This is intentional, not an oversight: this app is a tray-resident
+// clock meant to sit dark regardless of the desktop's light/dark setting, the
+// same way the tray icon itself does not repaint for the system theme.
 func (t *Theme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
 	switch n {
 	case theme.ColorNameBackground:

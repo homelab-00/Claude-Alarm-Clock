@@ -67,12 +67,23 @@ func TestThemeOverridesBackgroundAndCard(t *testing.T) {
 
 // The clock face is routed by TextStyle.Monospace. Symbol must be left alone --
 // hijacking it breaks icon and emoji rendering.
+//
+// Asserting mono is merely non-nil is not enough: Fyne's own default theme
+// also returns a non-nil monospace font, so that assertion would still pass
+// even if Font()'s custom-routing branch were deleted entirely and every
+// TextStyle fell through to theme.DefaultTheme().Font(s). The embedded
+// JetBrains Mono was chosen for tabular digits specifically so the clock face
+// does not jitter sideways as the seconds tick, so the test must pin down
+// that the *embedded* resource is what comes back, not just "some font".
 func TestThemeFontRoutesMonospaceButNotSymbol(t *testing.T) {
 	th := NewTheme()
 
 	mono := th.Font(fyne.TextStyle{Monospace: true})
 	if mono == nil {
 		t.Fatal("Font(monospace) returned nil")
+	}
+	if mono != resMonoBold {
+		t.Fatalf("Font(monospace) = %q, want the embedded resMonoBold %q", mono.Name(), resMonoBold.Name())
 	}
 
 	symbol := th.Font(fyne.TextStyle{Symbol: true})

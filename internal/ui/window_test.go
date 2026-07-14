@@ -125,6 +125,36 @@ func TestWindowRunNowIsHiddenUnlessMissed(t *testing.T) {
 	}
 }
 
+// The button row must not reserve space for a hidden Run now: a
+// GridWithColumns would keep the cell even while hidden, leaving Arm stuck at
+// half width in every state except MISSED.
+func TestWindowArmButtonSpansFullWidthWhenRunNowHidden(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
+	if !w.runNowBtn.Hidden {
+		t.Fatal("Run now must be hidden outside the MISSED state")
+	}
+
+	idleWidth := w.buttons.MinSize().Width
+	armWidth := w.armBtn.MinSize().Width
+	if idleWidth != armWidth {
+		t.Fatalf("buttons row MinSize width = %v while Run now is hidden, want it to match Arm's own width %v "+
+			"(the row must not reserve a cell for a hidden button)", idleWidth, armWidth)
+	}
+
+	w.Apply(app.Event{Status: app.StatusMissed, Now: time.Now()})
+	if w.runNowBtn.Hidden {
+		t.Fatal("Run now must be visible in the MISSED state")
+	}
+
+	missedWidth := w.buttons.MinSize().Width
+	if missedWidth <= idleWidth {
+		t.Fatalf("buttons row MinSize width = %v while Run now is shown, want it wider than the hidden-state width %v",
+			missedWidth, idleWidth)
+	}
+}
+
 func TestWindowTimeEntryValidatesHHMM(t *testing.T) {
 	w := newTestWindow(t)
 
@@ -140,6 +170,32 @@ func TestWindowTimeEntryValidatesHHMM(t *testing.T) {
 	w.timeEntry.SetText("07:30")
 	if err := w.timeEntry.Validate(); err != nil {
 		t.Fatalf("07:30 must validate: %v", err)
+	}
+}
+
+// The target-time entry's validator must be exactly as strict as
+// stateFromForm's parser (schedule.ParseHHMM), or the field can tell the user
+// their input is valid and then Arm can reject it. In particular, Go's "15"
+// layout verb is variable-width, so time.Parse("15:04", "7:30") succeeds --
+// an un-padded validator would wrongly accept "7:30".
+func TestWindowTimeEntryValidatorMatchesParseHHMM(t *testing.T) {
+	w := newTestWindow(t)
+
+	accept := []string{"07:30", "00:00", "23:59"}
+	for _, s := range accept {
+		w.timeEntry.SetText(s)
+		if err := w.timeEntry.Validate(); err != nil {
+			t.Errorf("Validate(%q) = %v, want it to accept", s, err)
+		}
+	}
+
+	reject := []string{"7:30", "24:00", "07:60", "abc", ""}
+	for _, s := range reject {
+		w.timeEntry.SetText(s)
+		if err := w.timeEntry.Validate(); err == nil {
+			t.Errorf("Validate(%q) = nil, want it to reject (un-padded input must not pass; "+
+				"stateFromForm's schedule.ParseHHMM rejects it, and the two must agree)", s)
+		}
 	}
 }
 
