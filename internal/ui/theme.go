@@ -1,0 +1,79 @@
+package ui
+
+import (
+	"image/color"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/theme"
+)
+
+// Custom theme names. Fyne's name types are just strings, so a theme can define
+// its own and look them up with theme.ColorForWidget / theme.SizeForWidget.
+const (
+	// ColorNameCard is the elevated panel behind the clock.
+	ColorNameCard fyne.ThemeColorName = "card"
+	// SizeNameClock is the point size of the clock face.
+	SizeNameClock fyne.ThemeSizeName = "clock"
+)
+
+// The palette. Near-black rather than pure black, and an elevated card a few
+// steps lighter -- pure black plus default grey is the look of an unstyled app.
+//
+// Primary/accent is deliberately left to theme.DefaultTheme(): this theme only
+// overrides background and card, so Fyne's own primary colour (and everything
+// derived from it, e.g. focus and selection colours) keeps working unchanged.
+var (
+	colBackground = color.NRGBA{R: 0x12, G: 0x14, B: 0x18, A: 0xFF}
+	colCard       = color.NRGBA{R: 0x1B, G: 0x1E, B: 0x25, A: 0xFF}
+)
+
+// Theme is the app's look.
+//
+// Every method MUST fall through to theme.DefaultTheme() for names it does not
+// handle. A theme that returns a zero value for an unknown name renders the app
+// as invisible text on an invisible background.
+type Theme struct{}
+
+// NewTheme returns the app theme.
+func NewTheme() *Theme { return &Theme{} }
+
+var _ fyne.Theme = (*Theme)(nil)
+
+func (t *Theme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	switch n {
+	case theme.ColorNameBackground:
+		return colBackground
+	case ColorNameCard:
+		return colCard
+	}
+	return theme.DefaultTheme().Color(n, v)
+}
+
+// Font routes the clock face by TextStyle.Monospace.
+//
+// Note we never touch TextStyle.Symbol: Fyne uses that to select the icon font,
+// and hijacking it breaks icon and emoji rendering everywhere in the app.
+func (t *Theme) Font(s fyne.TextStyle) fyne.Resource {
+	if s.Monospace && resMonoBold != nil {
+		return resMonoBold
+	}
+	return theme.DefaultTheme().Font(s)
+}
+
+func (t *Theme) Icon(n fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(n)
+}
+
+func (t *Theme) Size(n fyne.ThemeSizeName) float32 {
+	switch n {
+	case SizeNameClock:
+		return 88
+	case theme.SizeNameCardRadius:
+		return 12
+	case theme.SizeNameInputRadius:
+		return 8
+	case theme.SizeNameSelectionRadius:
+		return 8
+	}
+	return theme.DefaultTheme().Size(n)
+}
