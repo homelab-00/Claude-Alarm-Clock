@@ -3,8 +3,11 @@ package runner
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -88,6 +91,51 @@ func TestCLIRunTimesOut(t *testing.T) {
 	}
 	if elapsed > 3*time.Second {
 		t.Fatalf("took %v to time out; the deadline is not being enforced", elapsed)
+	}
+}
+
+// On a real timeout the real `claude` CLI -- a Node process that forks
+// helpers -- hangs forever retrying a failed network request. If the
+// timeout path only killed the direct child (the shape exec.CommandContext
+// gives you for free), that retry loop would be orphaned and keep running
+// in the background: one leaked process per failed alarm. This proves the
+// whole process group is killed, not just the immediate child.
+//
+// orphan.sh backgrounds a long sleep (the stand-in for the orphan-prone
+// grandchild), records its pid in cmd.Dir, then itself sleeps. After Run()
+// times out, the recorded pid must no longer be alive.
+func TestCLIRunKillsOrphanedGrandchildOnTimeout(t *testing.T) {
+	c := cfg(t, "orphan.sh")
+	c.Timeout = 300 * time.Millisecond
+
+	_, err := NewCLI().Run(context.Background(), c)
+	if err == nil {
+		t.Fatal("Run() error = nil, want a timeout")
+	}
+
+	pidFile := filepath.Join(c.WorkDir, "orphan.pid")
+	pidBytes, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatalf("orphan.sh did not write its grandchild's pid: %v", readErr)
+	}
+	pidStr := strings.TrimSpace(string(pidBytes))
+	pid, convErr := strconv.Atoi(pidStr)
+	if convErr != nil {
+		t.Fatalf("orphan.pid contained %q, not a pid: %v", pidStr, convErr)
+	}
+
+	// Poll instead of a fixed sleep: this must be deterministic, not a race
+	// against an arbitrary delay.
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		killErr := syscall.Kill(pid, 0)
+		if errors.Is(killErr, syscall.ESRCH) {
+			return // gone -- the grandchild was reaped along with its parent
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild pid %d is still alive 1s after Run() returned; the timeout orphaned it", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

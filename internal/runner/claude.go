@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -55,16 +56,48 @@ func (CLI) Run(ctx context.Context, c Config) (Result, error) {
 	// CLI wait 3 seconds for input that never arrives.
 	cmd.Stdin = nil
 
-	// Killing the direct child on cancellation is not enough: if that child is
-	// itself a wrapper (a shell script, say) that forked a grandchild before
-	// dying, the grandchild can be orphaned still holding the stdout/stderr
-	// pipes open. Without a bound, cmd.Wait would then block until that
-	// orphan exits on its own -- observed empirically via the hang.sh
-	// fixture, where killing the wrapping `sh` left `sleep 300` running
-	// and cmd.Run() blocked for the full 5 minutes instead of returning at
-	// the deadline. WaitDelay bounds that: once it elapses after the
-	// context is done, Go force-closes the pipes so Wait returns promptly
-	// regardless of what any orphaned descendant is doing.
+	// Put the child in its own process group, so that on timeout we can kill
+	// the whole tree it spawned instead of only the direct child.
+	//
+	// Why this matters: cmd.Wait blocks until the stdout/stderr pipes are
+	// closed by every process that inherited them, not just the direct
+	// child. A wrapper -- a shell script, or the real `claude` binary, which
+	// is a Node process that forks helpers -- can be killed while a
+	// descendant it spawned keeps those pipes open, and Wait then blocks on
+	// that descendant regardless of what happened to the direct child. This
+	// was observed empirically via the hang.sh fixture: killing the
+	// wrapping `sh` left the grandchild `sleep 300` running and holding the
+	// pipes, and cmd.Run() blocked for the full 5 minutes instead of
+	// returning at the deadline.
+	//
+	// Setpgid makes this child the leader of a new process group; every
+	// descendant it forks joins that group unless it explicitly opts out.
+	// That lets cmd.Cancel (below) address the whole group at once with a
+	// negative pid, so the kill reaches the orphan too -- not just the
+	// direct child.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// exec.CommandContext's default Cancel calls cmd.Process.Kill(), which
+	// signals only the direct child. That is not enough on its own (see the
+	// Setpgid comment above): on a real timeout the real `claude` CLI hangs
+	// forever retrying a failed network request, and killing only the
+	// wrapper would leave that retry loop running in the background --
+	// silently, forever, one orphan per failed alarm. Kill the entire
+	// process group instead: the negative pid tells kill(2) "the group",
+	// not "the process". See kill(2) and setpgid(2).
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	// Backstop for the (believed impossible, given Setpgid above) case where
+	// some descendant still escapes the group and keeps the pipes open:
+	// without a bound, cmd.Wait would block until that straggler exits on
+	// its own. WaitDelay bounds that -- once it elapses after the context is
+	// done, Go force-closes the pipes so Wait returns promptly regardless of
+	// what anything else is doing.
 	cmd.WaitDelay = 1 * time.Second
 
 	var stdout, stderr bytes.Buffer
