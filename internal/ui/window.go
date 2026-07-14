@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -36,8 +37,11 @@ type Window struct {
 	promptEntry *widget.Entry
 
 	armBtn    *widget.Button
+	armed     bool // drives onArm's branch; armBtn.Text is presentational only
 	runNowBtn *widget.Button
 	buttons   *fyne.Container
+
+	resultCard *Card // shows Claude's answer; its MinSize must never collapse
 
 	content fyne.CanvasObject
 }
@@ -131,15 +135,21 @@ func (w *Window) build() fyne.CanvasObject {
 	// recomputed rather than left stale from construction.
 	w.buttons = container.NewBorder(nil, nil, nil, w.runNowBtn, w.armBtn)
 
-	resultCard := NewCard(container.NewVScroll(w.result))
-	resultCard.Resize(fyne.NewSize(0, 140))
+	// container.VBox lays out children at their MinSize and discards any
+	// pre-layout Resize() call, and Scroll.MinSize() is max(32, s.minSize) --
+	// it does not grow with content. SetMinSize is the real API for giving a
+	// scroll region a floor height, so the result pane (the whole point of
+	// this app) never collapses to a one-line sliver.
+	resultScroll := container.NewVScroll(w.result)
+	resultScroll.SetMinSize(fyne.NewSize(0, 140))
+	w.resultCard = NewCard(resultScroll)
 
 	return container.NewPadded(container.NewVBox(
 		clockCard,
 		form,
 		w.buttons,
 		advanced,
-		resultCard,
+		w.resultCard,
 	))
 }
 
@@ -165,32 +175,44 @@ func (w *Window) Apply(e app.Event) {
 	switch e.Status {
 	case app.StatusIdle:
 		w.status.SetText("Idle")
-		w.setArmButton("Arm", widget.HighImportance)
+		w.setArmButton(false)
 
 	case app.StatusArmed:
 		w.status.SetText(fmt.Sprintf("Armed · fires in %s (at %s, for a %s target)",
-			roundDur(e.Remaining), e.FireAt.Format("15:04:05"), e.Target.Format("15:04")))
-		w.setArmButton("Disarm", widget.DangerImportance)
+			humanDur(roundDur(e.Remaining)), e.FireAt.Format("15:04:05"), e.Target.Format("15:04")))
+		w.setArmButton(true)
 
 	case app.StatusRunning:
 		w.status.SetText("Running Claude Code…")
-		w.setArmButton("Disarm", widget.DangerImportance)
+		w.setArmButton(true)
 
 	case app.StatusDone:
 		w.status.SetText(fmt.Sprintf("Done · %s · $%.4f",
-			roundDur(e.Result.Duration), e.Result.CostUSD))
+			humanDur(roundDur(e.Result.Duration)), e.Result.CostUSD))
 		w.result.SetText(e.Result.Text)
-		w.setArmButton("Arm", widget.HighImportance)
+		w.setArmButton(false)
 
 	case app.StatusMissed:
 		w.status.SetText(fmt.Sprintf("MISSED · the alarm was due at %s, %s ago. Claude Code was not run.",
-			e.FireAt.Format("15:04:05"), roundDur(e.Late)))
-		w.setArmButton("Arm", widget.HighImportance)
+			e.FireAt.Format("15:04:05"), humanDur(roundDur(e.Late))))
+		w.setArmButton(false)
 		w.runNowBtn.Show()
 
 	case app.StatusError:
-		w.status.SetText("Error · " + e.Err.Error())
-		w.setArmButton("Arm", widget.HighImportance)
+		msg := "unknown error"
+		if e.Err != nil {
+			msg = e.Err.Error()
+		}
+		w.status.SetText("Error · " + msg)
+		w.setArmButton(false)
+
+	default:
+		// app.Status is a closed enum (internal/app/core.go); every value it
+		// defines is handled above. If a new one is ever added without a
+		// matching case here, say so loudly instead of silently leaving
+		// stale text on screen.
+		w.status.SetText(fmt.Sprintf("Unknown status: %v", e.Status))
+		w.setArmButton(false)
 	}
 
 	// Hide/Show only refresh the button itself, not the Border container that
@@ -199,14 +221,24 @@ func (w *Window) Apply(e app.Event) {
 	w.buttons.Refresh()
 }
 
-func (w *Window) setArmButton(label string, imp widget.Importance) {
-	w.armBtn.Text = label
-	w.armBtn.Importance = imp
+// setArmButton sets both the armed/disarmed state that onArm branches on and
+// the button's presentation. The label is display-only -- renaming or
+// localising it (this app's owner works in Greece) must never change
+// behaviour, so onArm reads w.armed, never w.armBtn.Text.
+func (w *Window) setArmButton(armed bool) {
+	w.armed = armed
+	if armed {
+		w.armBtn.Text = "Disarm"
+		w.armBtn.Importance = widget.DangerImportance
+	} else {
+		w.armBtn.Text = "Arm"
+		w.armBtn.Importance = widget.HighImportance
+	}
 	w.armBtn.Refresh()
 }
 
 func (w *Window) onArm() {
-	if w.armBtn.Text == "Disarm" {
+	if w.armed {
 		w.core.Disarm()
 		return
 	}
@@ -242,13 +274,16 @@ func (w *Window) stateFromForm() (config.State, error) {
 		return config.State{}, err
 	}
 
-	mins, err := strconv.Atoi(w.offsetEntry.Text)
-	if err != nil {
-		return config.State{}, fmt.Errorf("lead-in must be a whole number of minutes")
+	// minutesValidator is the single source of truth for the offset field, for
+	// the same reason timeValidator is for the time field above: if
+	// stateFromForm re-derived its own rules and they drifted from the
+	// widget's validator (as they did before this fix -- the widget enforced
+	// an upper bound of 24h that this method did not), the field could show
+	// "valid" for input Arm then rejects, with two different error messages.
+	if err := minutesValidator(w.offsetEntry.Text); err != nil {
+		return config.State{}, fmt.Errorf("lead-in %s", err)
 	}
-	if mins < 0 {
-		return config.State{}, fmt.Errorf("lead-in cannot be negative")
-	}
+	mins, _ := strconv.Atoi(w.offsetEntry.Text) // minutesValidator already confirmed this parses
 
 	st.Spec.Hour = hour
 	st.Spec.Minute = minute
@@ -299,4 +334,41 @@ func roundDur(d time.Duration) time.Duration {
 	default:
 		return d.Round(10 * time.Millisecond)
 	}
+}
+
+// humanDur formats a duration for a human, not a debugger: Go's
+// Duration.String() always prints down to seconds once minutes are present
+// (10m0s) and down to minutes once hours are present (2h35m0s), so the UI
+// read "fires in 10m0s" and "2h35m0s ago". This drops that trailing
+// zero-valued component. roundDur has already rounded d to the coarsest unit
+// that matters (minute once >= 1h, second once >= 1m), so h>0 implies the
+// seconds component is always zero -- there is nothing to lose by omitting it.
+// Below a minute, Go's own formatting is already precise and free of the bug
+// (fractional seconds are trimmed of trailing zeros), so it is used as-is.
+func humanDur(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	if d < time.Minute {
+		return d.String()
+	}
+
+	h := d / time.Hour
+	m := (d % time.Hour) / time.Minute
+	s := (d % time.Minute) / time.Second
+
+	var b strings.Builder
+	if h > 0 {
+		fmt.Fprintf(&b, "%dh", h)
+	}
+	if m > 0 {
+		fmt.Fprintf(&b, "%dm", m)
+	}
+	if s > 0 && h == 0 {
+		fmt.Fprintf(&b, "%ds", s)
+	}
+	if b.Len() == 0 {
+		return "0m"
+	}
+	return b.String()
 }

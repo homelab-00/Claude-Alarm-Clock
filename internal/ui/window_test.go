@@ -50,6 +50,9 @@ func TestWindowArmedStateShowsCountdown(t *testing.T) {
 	if !strings.Contains(w.status.Text, "10m") {
 		t.Fatalf("status = %q, want it to show the countdown", w.status.Text)
 	}
+	if strings.Contains(w.status.Text, "10m0s") {
+		t.Fatalf("status = %q, want the trailing zero seconds dropped (\"10m\", not \"10m0s\")", w.status.Text)
+	}
 	if w.armBtn.Text != "Disarm" {
 		t.Fatalf("arm button = %q, want Disarm while armed", w.armBtn.Text)
 	}
@@ -95,6 +98,9 @@ func TestWindowMissedStateShowsHowLateAndOffersRunNow(t *testing.T) {
 	if !strings.Contains(w.status.Text, "2h35m") {
 		t.Fatalf("status = %q, want it to say how late", w.status.Text)
 	}
+	if strings.Contains(w.status.Text, "2h35m0s") {
+		t.Fatalf("status = %q, want the trailing zero seconds dropped (\"2h35m\", not \"2h35m0s\")", w.status.Text)
+	}
 	if w.runNowBtn.Hidden {
 		t.Fatal("the Run now button must be visible in the MISSED state")
 	}
@@ -114,6 +120,22 @@ func TestWindowErrorStateShowsTheError(t *testing.T) {
 	}
 }
 
+// Apply is a public method; nothing enforces that a StatusError event carries
+// a non-nil Err. It must not panic on a nil-pointer dereference of e.Err.
+func TestWindowErrorStateWithNilErrDoesNotPanic(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{
+		Status: app.StatusError,
+		Now:    time.Date(2026, 7, 14, 7, 12, 0, 0, time.Local),
+		Err:    nil,
+	})
+
+	if !strings.Contains(w.status.Text, "Error") {
+		t.Fatalf("status = %q, want a generic error surfaced instead of a panic", w.status.Text)
+	}
+}
+
 // Run now is only for the MISSED state; it must not be visible otherwise.
 func TestWindowRunNowIsHiddenUnlessMissed(t *testing.T) {
 	w := newTestWindow(t)
@@ -122,6 +144,25 @@ func TestWindowRunNowIsHiddenUnlessMissed(t *testing.T) {
 
 	if !w.runNowBtn.Hidden {
 		t.Fatal("the Run now button must be hidden when not missed")
+	}
+}
+
+// Unlike TestWindowRunNowIsHiddenUnlessMissed, which applies a single event to
+// a freshly constructed Window (where Run now starts hidden regardless of
+// what Apply does), this exercises the actual MISSED -> not-MISSED
+// transition: it must re-hide Run now, not just leave it hidden from
+// construction.
+func TestWindowRunNowIsHiddenAfterLeavingMissed(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{Status: app.StatusMissed, Now: time.Now()})
+	if w.runNowBtn.Hidden {
+		t.Fatal("the Run now button must be visible in the MISSED state")
+	}
+
+	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
+	if !w.runNowBtn.Hidden {
+		t.Fatal("the Run now button must be hidden again after leaving MISSED")
 	}
 }
 
@@ -230,5 +271,90 @@ func TestWindowStateFromForm(t *testing.T) {
 	}
 	if st.Spec.Offset != 15*time.Minute {
 		t.Fatalf("offset = %v, want 15m", st.Spec.Offset)
+	}
+}
+
+// minutesValidator's upper bound (n >= 24*60) must be the single source of
+// truth for the offset field: stateFromForm used to re-derive the check and
+// omit that bound, so the widget marked "1500" invalid while Arm accepted it
+// anyway -- the same "two validators disagree" bug class as the time field.
+func TestWindowOffsetEntryUpperBoundMatchesStateFromForm(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.offsetEntry.SetText("1500")
+	if err := w.offsetEntry.Validate(); err == nil {
+		t.Fatal("1500 minutes (>= 24h) must not validate")
+	}
+
+	_, err := w.stateFromForm()
+	if err == nil {
+		t.Fatal("stateFromForm must reject a 1500-minute lead-in, matching the widget's own validator")
+	}
+}
+
+// The result pane is what displays Claude's answer -- the entire point of the
+// app. container.VBox lays out its children at their MinSize, and
+// Scroll.MinSize() defaults to max(32, s.minSize) rather than growing with
+// content, so without an explicit floor the pane renders as a one-line
+// sliver no matter how long the answer is.
+func TestWindowResultPaneDoesNotCollapse(t *testing.T) {
+	w := newTestWindow(t)
+
+	if got := w.resultCard.MinSize().Height; got < 140 {
+		t.Fatalf("result pane MinSize height = %v while empty, want at least 140", got)
+	}
+
+	long := strings.Repeat("This is a long answer from Claude with many lines of text.\n", 15)
+	w.Apply(app.Event{
+		Status: app.StatusDone,
+		Now:    time.Date(2026, 7, 14, 7, 10, 4, 0, time.Local),
+		Result: runner.Result{Text: long},
+	})
+
+	if got := w.resultCard.MinSize().Height; got < 140 {
+		t.Fatalf("result pane MinSize height = %v after a long answer, want at least 140 (the pane must not collapse)", got)
+	}
+}
+
+// The Arm/Disarm behaviour must be driven by Window.armed, not by comparing
+// armBtn.Text: renaming or localising that label (this app's owner works in
+// Greece) must not silently break arming/disarming.
+func TestWindowArmDisarmIsNotKeyedToButtonLabel(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{Status: app.StatusArmed, Now: time.Now(), FireAt: time.Now().Add(time.Minute), Target: time.Now().Add(time.Minute)})
+	if !w.armed {
+		t.Fatal("armed must be true after a StatusArmed event")
+	}
+
+	// Simulate localisation: the label no longer says "Disarm", but the
+	// button must still behave as the disarm control.
+	w.armBtn.Text = "Απενεργοποίηση"
+
+	w.onArm()
+
+	if w.core.State().Armed {
+		t.Fatal("onArm must have called Disarm even though the button's label was not literally \"Disarm\"")
+	}
+}
+
+// humanDur must drop Duration.String()'s trailing zero-valued components
+// ("10m0s" -> "10m", "2h35m0s" -> "2h35m", "1h0m0s" -> "1h") while leaving
+// genuinely sub-minute or non-zero readings alone.
+func TestHumanDur(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{10 * time.Minute, "10m"},
+		{2*time.Hour + 35*time.Minute, "2h35m"},
+		{time.Hour, "1h"},
+		{45 * time.Second, "45s"},
+		{5*time.Minute + 30*time.Second, "5m30s"},
+	}
+	for _, c := range cases {
+		if got := humanDur(c.in); got != c.want {
+			t.Errorf("humanDur(%v) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
