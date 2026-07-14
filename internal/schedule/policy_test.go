@@ -44,25 +44,59 @@ func TestDecideZeroGrace(t *testing.T) {
 	}
 }
 
-// Decide must compare wall clock to wall clock. A time.Time carrying a
-// monotonic reading must not be treated differently from one that has had it
-// stripped -- if it is, we have reintroduced the suspend bug inside a function
-// that looks like it compares wall clocks.
-func TestDecideIgnoresMonotonicReading(t *testing.T) {
+// TestDecideMonotonicAgreement checks that Decide returns the same answer no
+// matter which of now and fireAt carry a monotonic reading. It exercises all
+// four combinations: mono/mono, mono/stripped, stripped/mono, and
+// stripped/stripped.
+//
+// This is a WEAKER property than "immune to a suspend": it only shows that,
+// for two time.Time values that are not actually diverged, Decide's answer
+// does not depend on which of them happen to carry a monotonic reading. It
+// does not -- and cannot -- exercise the case Round(0) actually defends
+// against, which is a real suspend or clock step causing the monotonic and
+// wall clocks to disagree. Go's monotonic reading is only ever advanced by
+// the OS scheduler; there is no public API to fabricate a diverged one, and
+// no in-process test can force a kernel suspend. So this test cannot fail by
+// deleting the Round(0) calls in Decide: without a real divergence, the wall
+// and monotonic deltas between now and fireAt are identical in this process,
+// so every combination agrees regardless of which clock backs the
+// comparison. That stronger guarantee is out of reach for a unit test and is
+// verified instead by the real-suspend item in the manual test checklist.
+//
+// What this test does catch: any change to Decide that makes its result
+// depend on operand representation rather than on the time instants
+// themselves (e.g. an asymmetric fix that rounds one operand but not the
+// other) would still leave this test green today, for the same reason above
+// -- so treat it as documentation of the intended invariant, not as a
+// regression guard for the suspend bug.
+func TestDecideMonotonicAgreement(t *testing.T) {
 	// time.Now() carries a monotonic reading; Round(0) strips it.
-	withMono := time.Now()
-	stripped := withMono.Round(0)
+	monoNow := time.Now()
+	monoFire := monoNow.Add(-time.Minute) // one minute overdue, inside a 5m grace
+	strippedNow := monoNow.Round(0)
+	strippedFire := monoFire.Round(0)
 
-	fire := stripped.Add(-time.Minute) // one minute overdue, inside a 5m grace
+	const grace = 5 * time.Minute
 
-	got1 := Decide(withMono, fire, 5*time.Minute)
-	got2 := Decide(stripped, fire, 5*time.Minute)
-
-	if got1 != got2 {
-		t.Fatalf("Decide disagrees depending on monotonic reading: %v vs %v", got1, got2)
+	combos := []struct {
+		name string
+		now  time.Time
+		fire time.Time
+	}{
+		{"mono now / mono fireAt", monoNow, monoFire},
+		{"mono now / stripped fireAt", monoNow, strippedFire},
+		{"stripped now / mono fireAt", strippedNow, monoFire},
+		{"stripped now / stripped fireAt", strippedNow, strippedFire},
 	}
-	if got1 != DecideFire {
-		t.Fatalf("Decide = %v, want DecideFire", got1)
+
+	want := Decide(combos[0].now, combos[0].fire, grace)
+	for _, c := range combos {
+		if got := Decide(c.now, c.fire, grace); got != want {
+			t.Errorf("Decide(%s) = %v, want %v (agreement with mono/mono case)", c.name, got, want)
+		}
+	}
+	if want != DecideFire {
+		t.Fatalf("baseline Decide = %v, want DecideFire", want)
 	}
 }
 
