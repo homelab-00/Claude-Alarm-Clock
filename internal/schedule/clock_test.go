@@ -50,3 +50,47 @@ func TestManualTickerDeliversTicks(t *testing.T) {
 		t.Fatal("no tick delivered within 1s")
 	}
 }
+
+// After Stop, a Tick() call must return promptly and must not panic sending
+// on a closed channel. This would panic (or hang) against an implementation
+// where Stop does close(m.ch).
+func TestManualTickerTickAfterStopDoesNotPanicOrBlock(t *testing.T) {
+	mt := NewManualTicker()
+	mt.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		mt.Tick()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Tick() after Stop() did not return within 1s")
+	}
+}
+
+// Stop must be idempotent: calling it twice must not panic (a second
+// close of the same channel would panic).
+func TestManualTickerStopTwiceDoesNotPanic(t *testing.T) {
+	mt := NewManualTicker()
+	mt.Stop()
+	mt.Stop()
+}
+
+// After Stop, receiving on C() must behave like a real time.Ticker's channel
+// after Stop: it blocks forever, it does not yield a spurious ready receive.
+// If Stop closed the tick channel, this select would return the zero Time
+// immediately instead of hitting the timeout branch.
+func TestManualTickerCAfterStopDoesNotYieldSpuriousTick(t *testing.T) {
+	mt := NewManualTicker()
+	mt.Stop()
+
+	select {
+	case <-mt.C():
+		t.Fatal("C() delivered a spurious tick after Stop()")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: no tick, channel is not closed-and-always-ready.
+	}
+}

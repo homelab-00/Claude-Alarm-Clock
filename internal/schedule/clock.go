@@ -70,21 +70,41 @@ func (r realTicker) Stop()               { r.t.Stop() }
 func RealTicker(d time.Duration) Ticker { return realTicker{t: time.NewTicker(d)} }
 
 // ManualTicker is a Ticker that only ticks when a test says so.
+//
+// Stop must never close ch, the channel C() hands out. Closing it would make
+// two things happen, both wrong: a Tick() racing with (or following) Stop()
+// would panic sending on a closed channel, and a receive on C() after Stop()
+// would return immediately and repeatedly with a zero Time instead of
+// blocking forever like the real time.Ticker does. A loop written against
+// the real ticker's mental model — select { case <-tk.C(): ... } — would
+// busy-spin under that behavior, a bug that could only ever show up in
+// tests. So Stop() closes a separate done channel instead, and ch is never
+// closed.
 type ManualTicker struct {
 	ch   chan time.Time
+	done chan struct{}
 	once sync.Once
 }
 
 // NewManualTicker returns a ManualTicker with an unbuffered channel.
 func NewManualTicker() *ManualTicker {
-	return &ManualTicker{ch: make(chan time.Time)}
+	return &ManualTicker{ch: make(chan time.Time), done: make(chan struct{})}
 }
 
-// Tick delivers one tick, blocking until the loop receives it. The value sent
-// is deliberately the zero Time: the alarm loop must read the Clock, never the
-// tick payload. A test that depends on the payload is testing the wrong thing.
-func (m *ManualTicker) Tick() { m.ch <- time.Time{} }
+// Tick delivers one tick, blocking until the loop receives it or Stop is
+// called, whichever comes first. The value sent is deliberately the zero
+// Time: the alarm loop must read the Clock, never the tick payload. A test
+// that depends on the payload is testing the wrong thing.
+func (m *ManualTicker) Tick() {
+	select {
+	case m.ch <- time.Time{}:
+	case <-m.done:
+	}
+}
 
+// C returns the tick channel. It is never closed, so receiving on it after
+// Stop blocks forever — matching time.Ticker's post-Stop behavior exactly.
 func (m *ManualTicker) C() <-chan time.Time { return m.ch }
 
-func (m *ManualTicker) Stop() { m.once.Do(func() { close(m.ch) }) }
+// Stop is idempotent and safe to call concurrently with Tick.
+func (m *ManualTicker) Stop() { m.once.Do(func() { close(m.done) }) }
