@@ -170,6 +170,17 @@ func (w *Window) Apply(e app.Event) {
 		w.SetClock(e.Now)
 	}
 
+	// A ClockOnly event carries nothing but Now: the clock above has already
+	// been moved, and there is nothing else to do. In particular this must
+	// return before the runNowBtn.Hide()/switch below, or a bare tick that
+	// lands while the app is resting on a terminal status (Done/Missed/Error)
+	// would re-render that status from the tick's zeroed-out fields --
+	// wiping a real answer or error off the screen with "Done · 0s · $0.0000"
+	// or similar. See app.Event.ClockOnly.
+	if e.ClockOnly {
+		return
+	}
+
 	w.runNowBtn.Hide()
 
 	switch e.Status {
@@ -184,6 +195,11 @@ func (w *Window) Apply(e app.Event) {
 
 	case app.StatusRunning:
 		w.status.SetText("Running Claude Code…")
+		// A new run starts: clear out whatever answer the result pane was
+		// showing from the previous run. Otherwise, if this run errors, a
+		// stale success stays on screen underneath the "Error ·" status and
+		// the user reads a success that did not happen.
+		w.result.SetText("")
 		w.setArmButton(true)
 
 	case app.StatusDone:
@@ -195,6 +211,7 @@ func (w *Window) Apply(e app.Event) {
 	case app.StatusMissed:
 		w.status.SetText(fmt.Sprintf("MISSED · the alarm was due at %s, %s ago. Claude Code was not run.",
 			e.FireAt.Format("15:04:05"), humanDur(roundDur(e.Late))))
+		w.result.SetText("")
 		w.setArmButton(false)
 		w.runNowBtn.Show()
 
@@ -204,6 +221,7 @@ func (w *Window) Apply(e app.Event) {
 			msg = e.Err.Error()
 		}
 		w.status.SetText("Error · " + msg)
+		w.result.SetText("")
 		w.setArmButton(false)
 
 	default:

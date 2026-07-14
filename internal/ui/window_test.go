@@ -338,6 +338,68 @@ func TestWindowArmDisarmIsNotKeyedToButtonLabel(t *testing.T) {
 	}
 }
 
+// A ClockOnly tick must move the clock but must not overwrite whatever
+// terminal status/result text is currently on screen -- see app.Event.ClockOnly
+// and the EventTick handling in internal/app/core.go. Before this fix,
+// EventTick only ever produced a UI event when armed or exactly StatusIdle,
+// so the clock froze solid after Done/Missed/Error and for the whole
+// duration of a run.
+func TestWindowClockOnlyTickDoesNotOverwriteDoneText(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{
+		Status: app.StatusDone,
+		Now:    time.Date(2026, 7, 14, 7, 10, 4, 0, time.Local),
+		Result: runner.Result{Text: "Hello! How can I help you today?", CostUSD: 0.0044, Duration: 3312 * time.Millisecond},
+	})
+	wantStatus := w.status.Text
+	wantResult := w.result.Text
+
+	w.Apply(app.Event{
+		Status:    app.StatusDone,
+		Now:       time.Date(2026, 7, 14, 7, 10, 5, 0, time.Local),
+		ClockOnly: true,
+	})
+
+	if got := w.clock.Text; got != "07:10:05" {
+		t.Fatalf("clock = %q, want 07:10:05 (a ClockOnly tick must still move the clock)", got)
+	}
+	if w.status.Text != wantStatus {
+		t.Fatalf("status = %q, want unchanged %q (a ClockOnly tick must not touch the status text)", w.status.Text, wantStatus)
+	}
+	if w.result.Text != wantResult {
+		t.Fatalf("result = %q, want unchanged %q (a ClockOnly tick must not touch the result text)", w.result.Text, wantResult)
+	}
+}
+
+// A stale answer from a previous run must not remain visible underneath a
+// later non-Done status -- the user would read a success that did not
+// happen. Clear the result pane when a new run starts, and on Error/Missed.
+func TestWindowResultPaneClearsOnNewRunAndOnErrorAndMissed(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.Apply(app.Event{Status: app.StatusDone, Now: time.Now(), Result: runner.Result{Text: "old answer"}})
+	if w.result.Text == "" {
+		t.Fatal("setup: StatusDone must populate the result pane")
+	}
+	w.Apply(app.Event{Status: app.StatusRunning, Now: time.Now()})
+	if w.result.Text != "" {
+		t.Fatalf("result = %q, want cleared when a new run starts", w.result.Text)
+	}
+
+	w.Apply(app.Event{Status: app.StatusDone, Now: time.Now(), Result: runner.Result{Text: "old answer"}})
+	w.Apply(app.Event{Status: app.StatusError, Now: time.Now(), Err: errors.New("boom")})
+	if w.result.Text != "" {
+		t.Fatalf("result = %q, want cleared on StatusError", w.result.Text)
+	}
+
+	w.Apply(app.Event{Status: app.StatusDone, Now: time.Now(), Result: runner.Result{Text: "old answer"}})
+	w.Apply(app.Event{Status: app.StatusMissed, Now: time.Now()})
+	if w.result.Text != "" {
+		t.Fatalf("result = %q, want cleared on StatusMissed", w.result.Text)
+	}
+}
+
 // humanDur must drop Duration.String()'s trailing zero-valued components
 // ("10m0s" -> "10m", "2h35m0s" -> "2h35m", "1h0m0s" -> "1h") while leaving
 // genuinely sub-minute or non-zero readings alone.
