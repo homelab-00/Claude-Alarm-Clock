@@ -69,6 +69,27 @@ func TestCLIRunBadModelIsAnErrorDespiteSubtypeSayingSuccess(t *testing.T) {
 	}
 }
 
+// Node processes (which is what the real `claude` binary is) routinely log
+// diagnostics to stderr. When the CLI reports is_error:true, that stderr
+// output is exactly what the user needs to see -- the alarm just failed
+// unattended. Both is_error error messages (with and without
+// api_error_status) must surface it, along with the exit code.
+func TestCLIRunIsErrorSurfacesStderrAndExitCode(t *testing.T) {
+	_, err := NewCLI().Run(context.Background(), cfg(t, "bad_model_stderr.sh"))
+	if err == nil {
+		t.Fatal("Run() error = nil; is_error:true must not be reported as success")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Fatalf("error should surface the API status: %v", err)
+	}
+	if !strings.Contains(err.Error(), "node:internal warning") {
+		t.Fatalf("error should surface stderr: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit 1") {
+		t.Fatalf("error should surface the exit code: %v", err)
+	}
+}
+
 // A network failure makes the real CLI hang forever, with no output and no
 // exit. The context deadline is the only thing that saves us -- and the exit
 // code is -1 on a signal kill, so it cannot be used to detect this.
@@ -153,6 +174,9 @@ func TestCLIRunHonoursCallerCancellation(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run() error = nil, want cancellation")
 	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want it to wrap context.Canceled", err)
+	}
 	if time.Since(start) > 3*time.Second {
 		t.Fatalf("cancellation was not honoured")
 	}
@@ -165,6 +189,9 @@ func TestCLIRunUnparseableOutputSurfacesStderrAndExitCode(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "something went badly wrong") {
 		t.Fatalf("error should surface stderr: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit 2") {
+		t.Fatalf("error should surface the exit code: %v", err)
 	}
 }
 

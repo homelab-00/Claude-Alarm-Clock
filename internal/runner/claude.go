@@ -129,9 +129,11 @@ func (CLI) Run(ctx context.Context, c Config) (Result, error) {
 	// Branch on is_error, never on subtype.
 	if env.IsError {
 		if env.APIErrorStatus != nil {
-			return Result{}, fmt.Errorf("claude failed (HTTP %d): %s", *env.APIErrorStatus, env.Result)
+			return Result{}, fmt.Errorf("claude failed (HTTP %d, exit: %v%s): %s",
+				*env.APIErrorStatus, exitDesc(runErr), stderrSuffix(stderr.String()), env.Result)
 		}
-		return Result{}, fmt.Errorf("claude failed: %s", env.Result)
+		return Result{}, fmt.Errorf("claude failed (exit: %v%s): %s",
+			exitDesc(runErr), stderrSuffix(stderr.String()), env.Result)
 	}
 
 	if runErr != nil {
@@ -146,6 +148,16 @@ func (CLI) Run(ctx context.Context, c Config) (Result, error) {
 		Duration:  elapsed,
 		Raw:       stdout.String(),
 	}, nil
+}
+
+// stderrSuffix formats stderr for embedding inline in a larger error message,
+// e.g. "claude failed (exit: 1<suffix>): ...". Returns "" when stderr is
+// empty so callers never append a useless `stderr: ""` fragment.
+func stderrSuffix(s string) string {
+	if s == "" {
+		return ""
+	}
+	return fmt.Sprintf(", stderr: %q", s)
 }
 
 func exitDesc(err error) string {
