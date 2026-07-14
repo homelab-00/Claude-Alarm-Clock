@@ -107,9 +107,8 @@ have fired 12.5 hours late, with no way to detect that it had.
 
 So the alarm never arms a timer. A 1-second `time.Ticker` re-reads
 `time.Now()` on every tick and compares that wall-clock reading against the
-computed fire instant. This costs about 0.007% of one core, and it also
-gives the tray tooltip a live countdown for free. The same loop diffs the
-wall-clock delta against a monotonic delta between ticks to detect a
+computed fire instant. This costs about 0.007% of one core. The same loop
+diffs the wall-clock delta against a monotonic delta between ticks to detect a
 suspend or an NTP step — see `internal/schedule/policy.go` and
 `internal/schedule/alarm.go` for the detail, including why both times are
 passed through `.Round(0)` before comparison.

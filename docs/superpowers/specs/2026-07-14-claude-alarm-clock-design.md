@@ -180,8 +180,7 @@ it correct when the offset straddles a DST boundary.
 ### 5.2 The poll loop
 
 A 1-second `time.Ticker` re-reads `time.Now()` and compares wall clock to wall
-clock. Measured cost: 0.007% of one core. It also gives the tray tooltip a live
-countdown for free.
+clock. Measured cost: 0.007% of one core.
 
 Both operands get `.Round(0)` to strip the monotonic reading before comparison.
 This is subtle and essential: without it, `Before()` uses the monotonic readings
@@ -231,7 +230,9 @@ Let `now` be the wall clock at a tick, `fire` the computed alarm instant.
 - `now < fire` → tick; update countdown.
 - `fire <= now <= fire + Grace` → **fire**. Run Claude. Then disarm.
 - `now > fire + Grace` → **do not run.** Enter `MISSED` state, show how late it
-  was, disarm. Offer "Run now" and "Re-arm" buttons.
+  was, disarm. Offer a "Run now" button; the Arm button (now reading "Arm"
+  again, since the alarm disarmed itself) doubles as the way to re-arm for
+  the next occurrence -- there is no separate "Re-arm" button.
 
 **The grace window governs unobserved time only.** It answers exactly one
 question: "the app was not watching (suspended, or not running) — is this alarm
@@ -386,8 +387,10 @@ pane. The Arm button is `widget.HighImportance`, switching to
 `widget.DangerImportance` when armed.
 
 In the `MISSED` state (§5.3) the status area additionally shows how late the
-alarm was, plus two buttons: **Run now** (invoke Claude immediately) and
-**Re-arm** (recompute for the next occurrence).
+alarm was, plus a **Run now** button (invoke Claude immediately). There is no
+separate "Re-arm" button: MISSED already disarmed the alarm, so the Arm button
+has reverted to reading "Arm", and pressing it re-arms for the next
+occurrence.
 
 Working directory, model, and prompt live in a collapsed `widget.Accordion`
 labelled "Advanced", so the default view stays clean but nothing is hardcoded.
