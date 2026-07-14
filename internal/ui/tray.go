@@ -36,14 +36,22 @@ func InstallTray(a fyne.App, w fyne.Window, core *app.Core, icon fyne.Resource) 
 	if !ok {
 		return false
 	}
-	installTrayOn(desk, w, core, icon)
+	installTrayOn(a, desk, w, core, icon)
 	return true
 }
 
 // installTrayOn builds the menu and wires it to host. Split out from
 // InstallTray so it can be exercised with a fake trayHost in tests.
-func installTrayOn(host trayHost, w fyne.Window, core *app.Core, icon fyne.Resource) {
-	quit := fyne.NewMenuItem("Quit", func() { fyne.CurrentApp().Quit() })
+//
+// a is threaded through explicitly rather than read back via
+// fyne.CurrentApp(). A prior version reached for that global because this
+// function didn't receive the app; that is harmless in production --
+// app.New/app.NewWithID always call fyne.SetCurrentApp before this runs, and
+// there is one app per process -- but it was an invisible coupling that no
+// test could exercise. Passing a removes the hidden dependency and lets the
+// Quit action be asserted directly against the app it should call.
+func installTrayOn(a fyne.App, host trayHost, w fyne.Window, core *app.Core, icon fyne.Resource) {
+	quit := fyne.NewMenuItem("Quit", func() { a.Quit() })
 	// Without IsQuit, Fyne appends its OWN Quit item, which calls App.Quit()
 	// directly and skips anything we wanted to do first.
 	quit.IsQuit = true

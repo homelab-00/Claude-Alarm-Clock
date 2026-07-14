@@ -14,26 +14,54 @@ import (
 // is how recordingApply below proves an event never reaches the widget layer
 // except from inside a dispatch, which is the property that keeps every
 // widget write on the Fyne goroutine.
+//
+// Crucially, do must NOT run fn synchronously. The real fyne.Do queues fn
+// and returns immediately; a synchronous fake runs the closure before pump's
+// select loop can advance to its next iteration, which means a shared
+// loop-variable capture bug (var e app.Event declared outside the loop,
+// case e, ok = <-events instead of :=) is invisible: the closure reads e
+// before anything has a chance to overwrite it. Queuing the closures and
+// running them later, once every event has already been read off the
+// channel, is what makes that bug observable: a shared e would have been
+// overwritten to its final value by the time flush runs, so every queued
+// closure would report the same (wrong) event.
 type fakeDispatcher struct {
 	mu          sync.Mutex
 	calls       int
 	dispatching bool
+	queue       []func()
 }
 
-// do invokes fn synchronously, like fyne.Do would if the Fyne goroutine were
-// free immediately -- good enough to observe ordering and crossing without a
-// real Fyne driver.
+// do queues fn for later execution instead of running it inline, mirroring
+// fyne.Do's queue-and-return semantics.
 func (d *fakeDispatcher) do(fn func()) {
 	d.mu.Lock()
 	d.calls++
-	d.dispatching = true
+	d.queue = append(d.queue, fn)
 	d.mu.Unlock()
+}
 
-	fn()
-
+// flush runs every closure do() has queued so far, in the order they were
+// queued, marking dispatching true for the duration of each -- so
+// recordingApply's offCross check still catches an apply call that happens
+// outside of a do closure even though the run is deferred.
+func (d *fakeDispatcher) flush() {
 	d.mu.Lock()
-	d.dispatching = false
+	queue := d.queue
+	d.queue = nil
 	d.mu.Unlock()
+
+	for _, fn := range queue {
+		d.mu.Lock()
+		d.dispatching = true
+		d.mu.Unlock()
+
+		fn()
+
+		d.mu.Lock()
+		d.dispatching = false
+		d.mu.Unlock()
+	}
 }
 
 func (d *fakeDispatcher) isDispatching() bool {
@@ -95,6 +123,11 @@ func TestPumpDeliversEveryEventInOrder(t *testing.T) {
 	rec := &recordingApply{disp: disp}
 
 	pump(ctx, events, rec.apply, disp.do)
+	// pump has now read every event off the channel and queued one closure
+	// per event without running any of them -- exactly the moment a shared
+	// loop variable would already hold its final value. Only after that do
+	// we run the queued closures.
+	disp.flush()
 
 	got, offCross := rec.snapshot()
 	if offCross {
@@ -129,6 +162,7 @@ func TestPumpAppliesEveryEventThroughTheDispatcher(t *testing.T) {
 	rec := &recordingApply{disp: disp}
 
 	pump(ctx, events, rec.apply, disp.do)
+	disp.flush()
 
 	got, offCross := rec.snapshot()
 	if offCross {
