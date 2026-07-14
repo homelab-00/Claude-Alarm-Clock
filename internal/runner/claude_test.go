@@ -1,0 +1,209 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func script(t *testing.T, name string) string {
+	t.Helper()
+	p, err := filepath.Abs(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func cfg(t *testing.T, name string) Config {
+	t.Helper()
+	return Config{
+		Bin:       script(t, name),
+		WorkDir:   t.TempDir(),
+		Model:     DefaultModel,
+		Prompt:    DefaultPrompt,
+		BudgetUSD: DefaultBudgetUSD,
+		Timeout:   5 * time.Second,
+	}
+}
+
+func TestCLIRunSuccess(t *testing.T) {
+	got, err := NewCLI().Run(context.Background(), cfg(t, "ok.sh"))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if want := "Hello! How can I help you today?"; got.Text != want {
+		t.Fatalf("Text = %q, want %q", got.Text, want)
+	}
+	if got.CostUSD != 0.0044 {
+		t.Fatalf("CostUSD = %v, want 0.0044", got.CostUSD)
+	}
+	if got.SessionID != "1f0c8f2a-3d4e-4b5a-9c6d-7e8f9a0b1c2d" {
+		t.Fatalf("SessionID = %q", got.SessionID)
+	}
+	if got.Duration <= 0 {
+		t.Fatalf("Duration = %v, want > 0", got.Duration)
+	}
+	if !strings.Contains(got.Raw, "total_cost_usd") {
+		t.Fatalf("Raw does not look like the envelope: %q", got.Raw)
+	}
+}
+
+// THE trap test. The bad-model envelope reports "subtype":"success" alongside
+// "is_error":true. Any implementation that branches on subtype passes a 404
+// through as a successful answer. This test fails if we ever do that.
+func TestCLIRunBadModelIsAnErrorDespiteSubtypeSayingSuccess(t *testing.T) {
+	_, err := NewCLI().Run(context.Background(), cfg(t, "bad_model.sh"))
+	if err == nil {
+		t.Fatal("Run() error = nil; the envelope had is_error:true and must not be reported as success")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Fatalf("error should surface the API status: %v", err)
+	}
+}
+
+// A network failure makes the real CLI hang forever, with no output and no
+// exit. The context deadline is the only thing that saves us -- and the exit
+// code is -1 on a signal kill, so it cannot be used to detect this.
+func TestCLIRunTimesOut(t *testing.T) {
+	c := cfg(t, "hang.sh")
+	c.Timeout = 300 * time.Millisecond
+
+	start := time.Now()
+	_, err := NewCLI().Run(context.Background(), c)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Run() error = nil, want a timeout")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error should say it timed out: %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("took %v to time out; the deadline is not being enforced", elapsed)
+	}
+}
+
+// Cancelling the caller's context must also kill the child.
+func TestCLIRunHonoursCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := NewCLI().Run(ctx, cfg(t, "hang.sh"))
+
+	if err == nil {
+		t.Fatal("Run() error = nil, want cancellation")
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("cancellation was not honoured")
+	}
+}
+
+func TestCLIRunUnparseableOutputSurfacesStderrAndExitCode(t *testing.T) {
+	_, err := NewCLI().Run(context.Background(), cfg(t, "garbage.sh"))
+	if err == nil {
+		t.Fatal("Run() error = nil, want a parse failure")
+	}
+	if !strings.Contains(err.Error(), "something went badly wrong") {
+		t.Fatalf("error should surface stderr: %v", err)
+	}
+}
+
+// cmd.Dir is the only way to set the working directory: there is no --cwd flag.
+func TestCLIRunSetsWorkingDirectory(t *testing.T) {
+	c := cfg(t, "cwd.sh")
+	dir := t.TempDir()
+	c.WorkDir = dir
+
+	got, err := NewCLI().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// macOS symlinks /var -> /private/var; resolve before comparing.
+	wantDir, _ := filepath.EvalSymlinks(dir)
+	gotDir, _ := filepath.EvalSymlinks(strings.TrimSpace(got.Text))
+	if gotDir != wantDir {
+		t.Fatalf("claude ran in %q, want %q", gotDir, wantDir)
+	}
+}
+
+// BuildArgs is unit-tested in args_test.go, but that proves nothing about
+// whether those args actually reach exec. echoargs.sh returns its own argv as
+// the answer text, so this asserts the whole wiring end to end.
+func TestCLIRunActuallyPassesTheBuiltArgsToTheProcess(t *testing.T) {
+	got, err := NewCLI().Run(context.Background(), cfg(t, "echoargs.sh"))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	for _, want := range []string{"-p", "--model haiku", "--output-format json", "--safe-mode", "Hello world"} {
+		if !strings.Contains(got.Text, want) {
+			t.Fatalf("the process did not receive %q; it got: %s", want, got.Text)
+		}
+	}
+	for _, banned := range []string{"--dangerously-skip-permissions", "--bare"} {
+		if strings.Contains(got.Text, banned) {
+			t.Fatalf("the process received the banned flag %q: %s", banned, got.Text)
+		}
+	}
+}
+
+func TestLookupFindsClaudeOrSaysWhyNot(t *testing.T) {
+	path, err := Lookup()
+	if err != nil {
+		if !strings.Contains(err.Error(), "claude") {
+			t.Fatalf("error should name the binary: %v", err)
+		}
+		t.Skip("claude not installed on this machine; the error path is what we assert")
+	}
+	if path == "" {
+		t.Fatal("Lookup returned an empty path and no error")
+	}
+}
+
+func TestFakeRecordsCalls(t *testing.T) {
+	f := &Fake{Result: Result{Text: "faked"}}
+
+	c := Config{WorkDir: "/tmp", Model: "haiku", Prompt: "Hello world"}
+	got, err := f.Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Text != "faked" {
+		t.Fatalf("Text = %q, want faked", got.Text)
+	}
+	if f.CallCount() != 1 {
+		t.Fatalf("CallCount = %d, want 1", f.CallCount())
+	}
+	last, ok := f.LastCall()
+	if !ok || last.Prompt != "Hello world" {
+		t.Fatalf("LastCall = %+v", last)
+	}
+}
+
+func TestFakeReturnsConfiguredError(t *testing.T) {
+	want := errors.New("boom")
+	f := &Fake{Err: want}
+
+	_, err := f.Run(context.Background(), Config{})
+
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	if f.CallCount() != 1 {
+		t.Fatalf("a failing call must still be recorded")
+	}
+}
