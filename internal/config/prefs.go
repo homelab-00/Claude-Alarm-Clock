@@ -14,8 +14,8 @@ const (
 	keyHour    = "alarm.hour"
 	keyMinute  = "alarm.minute"
 	keyZone    = "alarm.zone"
-	keyOffset  = "alarm.offsetSeconds"
-	keyGrace   = "alarm.graceSeconds"
+	keyOffset  = "alarm.offsetNanos"
+	keyGrace   = "alarm.graceNanos"
 	keyWorkDir = "alarm.workDir"
 	keyModel   = "alarm.model"
 	keyPrompt  = "alarm.prompt"
@@ -30,8 +30,14 @@ const (
 // Requires the app to have been created with app.NewWithID -- Preferences()
 // does not work otherwise.
 //
-// Durations are stored as whole seconds and times as RFC3339 strings, because
-// fyne.Preferences only handles bool/int/float/string.
+// fyne.Preferences has no duration or time setter, only bool/int/float/string,
+// so both are encoded losslessly onto the types it does have:
+//
+//   - Durations are stored as their raw int64 nanosecond count (time.Duration
+//     already is a count of nanoseconds, so this is a plain int64->int
+//     conversion, not a unit change -- no division, no truncation).
+//   - Times are stored as time.RFC3339Nano strings, which retain sub-second
+//     precision that plain time.RFC3339 would silently drop.
 type PrefsStore struct{ p fyne.Preferences }
 
 // NewPrefsStore returns a Store backed by Fyne's preferences.
@@ -47,8 +53,8 @@ func (s *PrefsStore) Load() (State, error) {
 			Hour:   s.p.IntWithFallback(keyHour, def.Spec.Hour),
 			Minute: s.p.IntWithFallback(keyMinute, def.Spec.Minute),
 			Zone:   s.p.StringWithFallback(keyZone, def.Spec.Zone),
-			Offset: time.Duration(s.p.IntWithFallback(keyOffset, int(def.Spec.Offset/time.Second))) * time.Second,
-			Grace:  time.Duration(s.p.IntWithFallback(keyGrace, int(def.Spec.Grace/time.Second))) * time.Second,
+			Offset: time.Duration(s.p.IntWithFallback(keyOffset, int(def.Spec.Offset))),
+			Grace:  time.Duration(s.p.IntWithFallback(keyGrace, int(def.Spec.Grace))),
 		},
 		WorkDir: s.p.StringWithFallback(keyWorkDir, def.WorkDir),
 		Model:   s.p.StringWithFallback(keyModel, def.Model),
@@ -67,8 +73,8 @@ func (s *PrefsStore) Save(st State) error {
 	s.p.SetInt(keyHour, st.Spec.Hour)
 	s.p.SetInt(keyMinute, st.Spec.Minute)
 	s.p.SetString(keyZone, st.Spec.Zone)
-	s.p.SetInt(keyOffset, int(st.Spec.Offset/time.Second))
-	s.p.SetInt(keyGrace, int(st.Spec.Grace/time.Second))
+	s.p.SetInt(keyOffset, int(st.Spec.Offset))
+	s.p.SetInt(keyGrace, int(st.Spec.Grace))
 	s.p.SetString(keyWorkDir, st.WorkDir)
 	s.p.SetString(keyModel, st.Model)
 	s.p.SetString(keyPrompt, st.Prompt)
@@ -82,14 +88,14 @@ func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return t.Format(time.RFC3339)
+	return t.Format(time.RFC3339Nano)
 }
 
 func parseTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	t, err := time.Parse(time.RFC3339, s)
+	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
 		return time.Time{}
 	}
