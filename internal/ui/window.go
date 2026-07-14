@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -18,6 +19,10 @@ import (
 	"claudealarm/internal/schedule"
 )
 
+// invalidFireTime is the hero text shown when the form cannot produce a fire
+// time at all (bad HH:MM, bad lead-in).
+const invalidFireTime = "--:--"
+
 // Window is the main view.
 //
 // Every method that touches a widget must run on the Fyne goroutine. Apply is
@@ -26,9 +31,22 @@ type Window struct {
 	core *app.Core
 	win  fyne.Window // set by Attach; nil in tests
 
-	clock  *canvas.Text
-	status *widget.Label
-	result *widget.Label
+	// hero is the app's one big number: a live countdown to the fire time
+	// while armed, or the fire time the current form would produce
+	// otherwise. This deliberately replaced a clock showing the current
+	// time -- the user already has a clock in their desktop panel; the
+	// only thing this app uniquely knows is when Claude will run.
+	hero *canvas.Text
+	// explainer spells out, in a sentence, what hero's number means: the
+	// fire time, the lead-in, and the target it precedes. It is what
+	// actually teaches the user the difference between the two fields.
+	explainer *widget.Label
+	status    *widget.Label
+	result    *widget.Label
+
+	// nowText is the current time, demoted to a small, quiet line: it is
+	// context (and the app's only "I am alive" tray signal), not content.
+	nowText *canvas.Text
 
 	timeEntry   *widget.Entry
 	offsetEntry *widget.Entry
@@ -40,6 +58,16 @@ type Window struct {
 	armed     bool // drives onArm's branch; armBtn.Text is presentational only
 	runNowBtn *widget.Button
 	buttons   *fyne.Container
+	advanced  *widget.Accordion
+
+	// armedFireAt/armedTarget/armedRemaining cache the schedule from the
+	// most recent StatusArmed event (the alarm re-emits one every second
+	// while armed, ticking Remaining down). hero/explainer read these,
+	// not the live form: editing the fields while armed must not
+	// retroactively change what has already been scheduled.
+	armedFireAt    time.Time
+	armedTarget    time.Time
+	armedRemaining time.Duration
 
 	resultCard *Card // shows Claude's answer; its MinSize must never collapse
 
@@ -51,10 +79,14 @@ func NewWindow(core *app.Core) *Window {
 	w := &Window{core: core}
 	st := core.State()
 
-	w.clock = canvas.NewText("--:--:--", theme.Color(theme.ColorNameForeground))
-	w.clock.TextSize = theme.Size(SizeNameClock)
-	w.clock.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
-	w.clock.Alignment = fyne.TextAlignCenter
+	w.hero = canvas.NewText(invalidFireTime, theme.Color(theme.ColorNameForeground))
+	w.hero.TextSize = theme.Size(SizeNameClock)
+	w.hero.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	w.hero.Alignment = fyne.TextAlignCenter
+
+	w.explainer = widget.NewLabel("")
+	w.explainer.Alignment = fyne.TextAlignCenter
+	w.explainer.Wrapping = fyne.TextWrapWord
 
 	w.status = widget.NewLabel("Idle")
 	w.status.Alignment = fyne.TextAlignCenter
@@ -62,6 +94,13 @@ func NewWindow(core *app.Core) *Window {
 
 	w.result = widget.NewLabel("")
 	w.result.Wrapping = fyne.TextWrapWord
+
+	// nowText is quiet on purpose -- see the doc comment on the Window
+	// field. It still exists purely so the app has a visible heartbeat
+	// while it sits in the tray.
+	w.nowText = canvas.NewText("now --:--:--", theme.Color(theme.ColorNamePlaceHolder))
+	w.nowText.TextSize = theme.Size(theme.SizeNameCaptionText)
+	w.nowText.Alignment = fyne.TextAlignCenter
 
 	w.timeEntry = widget.NewEntry()
 	w.timeEntry.SetPlaceHolder("HH:MM")
@@ -81,6 +120,12 @@ func NewWindow(core *app.Core) *Window {
 	w.offsetEntry.SetText(strconv.Itoa(int(st.Spec.Offset / time.Minute)))
 	w.offsetEntry.Validator = minutesValidator
 
+	// The hero/explainer must track the form live, as the user types --
+	// this sentence is the only place the two fields' relationship is
+	// spelled out in plain language.
+	w.timeEntry.OnChanged = func(string) { w.refreshHeroAndExplainer() }
+	w.offsetEntry.OnChanged = func(string) { w.refreshHeroAndExplainer() }
+
 	w.workDirEnt = widget.NewEntry()
 	w.workDirEnt.SetText(st.WorkDir)
 
@@ -97,6 +142,9 @@ func NewWindow(core *app.Core) *Window {
 	w.runNowBtn.Hide() // only shown in the MISSED state
 
 	w.content = w.build()
+	// Render the initial hero/explainer from the form's starting values,
+	// same as any later edit would.
+	w.refreshHeroAndExplainer()
 	return w
 }
 
@@ -108,18 +156,19 @@ func (w *Window) Attach(win fyne.Window) { w.win = win }
 func (w *Window) Content() fyne.CanvasObject { return w.content }
 
 func (w *Window) build() fyne.CanvasObject {
-	clockCard := NewCard(container.NewVBox(
-		layoutCentre(w.clock),
+	heroCard := NewCard(container.NewVBox(
+		layoutCentre(w.hero),
+		w.explainer,
 		w.status,
 	))
 
 	form := widget.NewForm(
 		widget.NewFormItem("Target time", w.timeEntry),
-		widget.NewFormItem("Lead-in (min)", w.offsetEntry),
+		widget.NewFormItem("Run this early", w.offsetEntry),
 	)
 
 	browse := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), w.onBrowse)
-	advanced := widget.NewAccordion(
+	w.advanced = widget.NewAccordion(
 		widget.NewAccordionItem("Advanced", widget.NewForm(
 			widget.NewFormItem("Working dir", container.NewBorder(nil, nil, nil, browse, w.workDirEnt)),
 			widget.NewFormItem("Model", w.modelEntry),
@@ -143,24 +192,46 @@ func (w *Window) build() fyne.CanvasObject {
 	resultScroll := container.NewVScroll(w.result)
 	resultScroll.SetMinSize(fyne.NewSize(0, 140))
 	w.resultCard = NewCard(resultScroll)
+	// Hidden at rest -- see Apply. The window should be compact until
+	// there is actually an answer to show, not carry a permanent empty box.
+	w.resultCard.Hide()
 
-	return container.NewPadded(container.NewVBox(
-		clockCard,
+	// The window has a fixed size (see cmd/alarmclock/main.go), but the
+	// Advanced accordion can grow the content's real MinSize well past it
+	// when opened. container.VBox always resizes each child to that
+	// child's own MinSize regardless of the space actually available (see
+	// the comment above), so without a Scroll here the accordion's detail
+	// fields get laid out into space the fixed window never grants them --
+	// squeezed to near nothing, which reads as "renders empty" when
+	// expanded. Wrapping the whole body in a Scroll fixes it the same way
+	// resultScroll does above: Scroll.Refresh always resizes its Content to
+	// at least Content.MinSize(), so the accordion's expanded fields get
+	// their real size and a scrollbar appears for whatever the fixed
+	// window can't show at once.
+	return container.NewVScroll(container.NewPadded(container.NewVBox(
+		heroCard,
 		form,
 		w.buttons,
-		advanced,
+		w.advanced,
 		w.resultCard,
-	))
+		w.nowText,
+	)))
 }
 
 func layoutCentre(o fyne.CanvasObject) fyne.CanvasObject {
 	return container.NewCenter(o)
 }
 
-// SetClock updates the clock face. Fyne goroutine only.
+// SetClock updates the small, quiet "now" line. Fyne goroutine only.
+//
+// This used to drive the 88pt hero display; it was demoted because the
+// current time is context the user already has on their desktop clock, not
+// content only this app knows. It still has to tick every second regardless
+// of state -- it is the app's only visible "I am alive" signal while it sits
+// in the tray.
 func (w *Window) SetClock(t time.Time) {
-	w.clock.Text = t.Format("15:04:05")
-	w.clock.Refresh()
+	w.nowText.Text = "now " + t.Format("15:04:05")
+	w.nowText.Refresh()
 }
 
 // Apply renders one Event. Fyne goroutine only -- bridge.go wraps every call in
@@ -170,13 +241,13 @@ func (w *Window) Apply(e app.Event) {
 		w.SetClock(e.Now)
 	}
 
-	// A ClockOnly event carries nothing but Now: the clock above has already
-	// been moved, and there is nothing else to do. In particular this must
-	// return before the runNowBtn.Hide()/switch below, or a bare tick that
-	// lands while the app is resting on a terminal status (Done/Missed/Error)
-	// would re-render that status from the tick's zeroed-out fields --
-	// wiping a real answer or error off the screen with "Done · 0s · $0.0000"
-	// or similar. See app.Event.ClockOnly.
+	// A ClockOnly event carries nothing but Now: the "now" line above has
+	// already been moved, and there is nothing else to do. In particular
+	// this must return before the runNowBtn.Hide()/switch below, or a bare
+	// tick that lands while the app is resting on a terminal status
+	// (Done/Missed/Error) would re-render that status from the tick's
+	// zeroed-out fields -- wiping a real answer or error off the screen
+	// with "Done · 0s · $0.0000" or similar. See app.Event.ClockOnly.
 	if e.ClockOnly {
 		return
 	}
@@ -189,8 +260,12 @@ func (w *Window) Apply(e app.Event) {
 		w.setArmButton(false)
 
 	case app.StatusArmed:
-		w.status.SetText(fmt.Sprintf("Armed · fires in %s (at %s, for a %s target)",
-			humanDur(roundDur(e.Remaining)), e.FireAt.Format("15:04:05"), e.Target.Format("15:04")))
+		// Cache this tick's schedule for hero/explainer -- see the doc
+		// comment on the armedFireAt/armedTarget/armedRemaining fields.
+		w.armedFireAt = e.FireAt
+		w.armedTarget = e.Target
+		w.armedRemaining = e.Remaining
+		w.status.SetText("Armed")
 		w.setArmButton(true)
 
 	case app.StatusRunning:
@@ -200,18 +275,21 @@ func (w *Window) Apply(e app.Event) {
 		// stale success stays on screen underneath the "Error ·" status and
 		// the user reads a success that did not happen.
 		w.result.SetText("")
+		w.resultCard.Hide()
 		w.setArmButton(true)
 
 	case app.StatusDone:
 		w.status.SetText(fmt.Sprintf("Done · %s · $%.4f",
 			humanDur(roundDur(e.Result.Duration)), e.Result.CostUSD))
 		w.result.SetText(e.Result.Text)
+		w.resultCard.Show()
 		w.setArmButton(false)
 
 	case app.StatusMissed:
 		w.status.SetText(fmt.Sprintf("MISSED · the alarm was due at %s, %s ago. Claude Code was not run.",
 			e.FireAt.Format("15:04:05"), humanDur(roundDur(e.Late))))
 		w.result.SetText("")
+		w.resultCard.Hide()
 		w.setArmButton(false)
 		w.runNowBtn.Show()
 
@@ -222,6 +300,7 @@ func (w *Window) Apply(e app.Event) {
 		}
 		w.status.SetText("Error · " + msg)
 		w.result.SetText("")
+		w.resultCard.Hide()
 		w.setArmButton(false)
 
 	default:
@@ -232,6 +311,11 @@ func (w *Window) Apply(e app.Event) {
 		w.status.SetText(fmt.Sprintf("Unknown status: %v", e.Status))
 		w.setArmButton(false)
 	}
+
+	// setArmButton above has updated w.armed for this event, so the hero and
+	// explainer branch on the right bucket: the live countdown while armed,
+	// or the fire time the current form would produce otherwise.
+	w.refreshHeroAndExplainer()
 
 	// Hide/Show only refresh the button itself, not the Border container that
 	// lays it out, so the row must be told to recompute -- otherwise Arm stays
@@ -253,6 +337,122 @@ func (w *Window) setArmButton(armed bool) {
 		w.armBtn.Importance = widget.HighImportance
 	}
 	w.armBtn.Refresh()
+}
+
+// refreshHeroAndExplainer recomputes the hero readout and the explainer
+// sentence beneath it. It is the single place that decides what those two
+// widgets say, and it is called from three places that all need them kept
+// in sync: Apply (after every non-ClockOnly event), and the time/offset
+// entries' OnChanged handlers (so the sentence updates live as the user
+// types).
+func (w *Window) refreshHeroAndExplainer() {
+	if w.armed {
+		w.hero.Text = formatCountdown(w.armedRemaining)
+		w.explainer.SetText(armedExplainer(w.armedFireAt, w.armedTarget))
+		w.hero.Refresh()
+		return
+	}
+
+	fire, target, offset, err := w.formFireTime()
+	if err != nil {
+		w.hero.Text = invalidFireTime
+		w.explainer.SetText(err.Error())
+		w.hero.Refresh()
+		return
+	}
+
+	w.hero.Text = fire.Format("15:04")
+	w.explainer.SetText(idleExplainer(fire, target, offset))
+	w.hero.Refresh()
+}
+
+// formFireTime computes the fire time the form would currently produce, using
+// schedule.Spec.FireAt as the single source of truth for the arithmetic (it
+// is DST-correct; this method must never re-derive it). Errors carry
+// wording meant for the explainer sentence, not for a log -- the same
+// friendly voice as the rest of the form.
+func (w *Window) formFireTime() (fire, target time.Time, offset time.Duration, err error) {
+	hour, minute, perr := schedule.ParseHHMM(w.timeEntry.Text)
+	if perr != nil {
+		return time.Time{}, time.Time{}, 0, errors.New("Target time must be HH:MM, e.g. 07:30")
+	}
+
+	// minutesValidator is the single source of truth for the offset field --
+	// see the identical reasoning in stateFromForm.
+	if verr := minutesValidator(w.offsetEntry.Text); verr != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("Run this early %s", verr)
+	}
+	mins, _ := strconv.Atoi(w.offsetEntry.Text) // minutesValidator already confirmed this parses
+	offset = time.Duration(mins) * time.Minute
+
+	spec := schedule.Spec{Hour: hour, Minute: minute, Offset: offset}
+	fire, target, ferr := spec.FireAt(time.Now())
+	if ferr != nil {
+		return time.Time{}, time.Time{}, 0, ferr
+	}
+	return fire, target, offset, nil
+}
+
+// idleExplainer is the plain-language sentence for every state except
+// Armed: it names the fire time the form would produce, the lead-in, the
+// target, and how long from now that fire time is -- the "(in 11h 35m)"
+// suffix disambiguates a fire time that has rolled over to tomorrow
+// morning (see schedule.Spec.NextTarget).
+func idleExplainer(fire, target time.Time, offset time.Duration) string {
+	in := inDuration(time.Until(fire))
+	if offset <= 0 {
+		return fmt.Sprintf("Claude Code will run at %s — exactly at your target (in %s)",
+			fire.Format("15:04"), in)
+	}
+	return fmt.Sprintf("Claude Code will run at %s — %d min before your %s target (in %s)",
+		fire.Format("15:04"), int(offset/time.Minute), target.Format("15:04"), in)
+}
+
+// armedExplainer is the plain-language sentence while Armed. Unlike
+// idleExplainer it has no "(in ...)" suffix -- the hero readout right above
+// it is already a live countdown, so repeating "how long from now" would be
+// redundant.
+func armedExplainer(fireAt, target time.Time) string {
+	offset := target.Sub(fireAt)
+	if offset <= 0 {
+		return fmt.Sprintf("Runs at %s — exactly at your target", fireAt.Format("15:04"))
+	}
+	return fmt.Sprintf("Runs at %s — %d min before your %s target",
+		fireAt.Format("15:04"), int(offset/time.Minute), target.Format("15:04"))
+}
+
+// inDuration formats a duration for the explainer's "(in ...)" suffix, e.g.
+// "11h 35m" or "45m". Unlike humanDur (used for the status line's "ago"/
+// "fires in" phrasing elsewhere), this always keeps a space between the
+// hour and minute components, matching the sentence it sits inside.
+func inDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Minute)
+	h := d / time.Hour
+	m := (d % time.Hour) / time.Minute
+	switch {
+	case h > 0 && m > 0:
+		return fmt.Sprintf("%dh %dm", h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh", h)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
+}
+
+// formatCountdown renders the armed hero readout as HH:MM:SS, ticking every
+// second as Remaining counts down.
+func formatCountdown(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	m := (d % time.Hour) / time.Minute
+	s := (d % time.Minute) / time.Second
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 func (w *Window) onArm() {
