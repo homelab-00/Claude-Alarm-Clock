@@ -30,13 +30,31 @@ func newHarness(t *testing.T, start time.Time) *harness {
 	return &harness{t: t, clk: clk, tick: mt, alarm: a, stop: cancel}
 }
 
-// step advances the clock by d, delivers one tick, and returns every Update the
-// loop emitted for it.
+// step advances the clock (wall AND monotonic, exactly like ordinary time
+// passing -- or a late/starved tick) by d, delivers one tick, and returns
+// every Update the loop emitted for it.
 func (h *harness) step(d time.Duration) []Update {
 	h.t.Helper()
 	h.clk.Advance(d)
 	h.tick.Tick()
+	return h.collect()
+}
 
+// stepSuspend simulates a machine suspend of duration d: the wall clock jumps
+// forward by d while the monotonic clock does not move at all, exactly what
+// TestClock.Suspend models a sleeping laptop as. It then delivers one tick
+// and returns every Update the loop emitted for it.
+func (h *harness) stepSuspend(d time.Duration) []Update {
+	h.t.Helper()
+	h.clk.Suspend(d)
+	h.tick.Tick()
+	return h.collect()
+}
+
+// collect drains every Update the loop has ready to emit for the tick just
+// delivered.
+func (h *harness) collect() []Update {
+	h.t.Helper()
 	var got []Update
 	for {
 		select {
@@ -126,8 +144,9 @@ func TestAlarmSuspendPastGraceReportsMissedAndDoesNotFire(t *testing.T) {
 	fire := start.Add(10 * time.Minute)
 	h.alarm.Arm(fire, fire.Add(20*time.Minute), 5*time.Minute)
 
-	// The laptop lid closes. One tick later, 12h30m of wall clock has passed.
-	got := h.step(12*time.Hour + 30*time.Minute)
+	// The laptop lid closes. One tick later, 12h30m of wall clock has passed
+	// but the monotonic clock has not moved at all -- a real suspend.
+	got := h.stepSuspend(12*time.Hour + 30*time.Minute)
 
 	if !hasKind(got, EventJump) {
 		t.Fatalf("kinds = %v, want a jump event", kinds(got))
@@ -162,13 +181,36 @@ func TestAlarmSuspendWithinGraceStillFires(t *testing.T) {
 	h.alarm.Arm(fire, fire.Add(20*time.Minute), 5*time.Minute)
 
 	// Suspend for 4 minutes: 3 minutes past the fire time, inside a 5m grace.
-	got := h.step(4 * time.Minute)
+	got := h.stepSuspend(4 * time.Minute)
 
 	if !hasKind(got, EventFire) {
 		t.Fatalf("kinds = %v, want a fire (3m late is inside a 5m grace)", kinds(got))
 	}
 	if hasKind(got, EventMissed) {
 		t.Fatalf("kinds = %v, want no missed", kinds(got))
+	}
+}
+
+// A merely late tick -- the process was starved of CPU time, not suspended --
+// must NOT be reported as a clock jump. Wall and monotonic time both still
+// advance together here (h.step uses TestClock.Advance, not Suspend); only
+// their DIVERGENCE should ever trigger EventJump.
+//
+// This is the test that distinguishes a correct wall-vs-monotonic comparison
+// from the workaround it replaces, which substituted the ticker's nominal
+// period for the (unavailable, at the time) monotonic delta: DetectJump(wallDelta,
+// period, period) sees a 10s wallDelta against a 1s period on this harness's
+// 1-second ticker and false-positives a jump, even though nothing suspended.
+func TestAlarmLateTickIsNotMistakenForSuspend(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.UTC)
+	h := newHarness(t, start) // period is 1 second, see newHarness
+
+	// A starved process might go 10 periods between scheduler slices, but
+	// wall and monotonic clocks agree on how much time passed regardless.
+	got := h.step(10 * time.Second)
+
+	if hasKind(got, EventJump) {
+		t.Fatalf("kinds = %v, want no jump for a merely late (non-suspend) tick", kinds(got))
 	}
 }
 

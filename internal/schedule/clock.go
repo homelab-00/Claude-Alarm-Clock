@@ -8,23 +8,42 @@ import (
 
 // Clock is the seam that lets tests simulate a 12-hour suspend in microseconds.
 type Clock interface {
-	Now() time.Time
+	Now() time.Time      // wall clock
+	Mono() time.Duration // monotonic reading; only DIFFERENCES between calls are meaningful
 }
+
+// processStart is read once, at package init, via time.Now() -- so it carries
+// a monotonic reading. It exists solely so realClock.Mono can hand back a
+// Duration derived from a Sub of two monotonic-bearing Times.
+var processStart = time.Now()
 
 type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
+
+// Mono returns a duration that only advances while the machine is awake.
+//
+// time.Since(processStart) is time.Now().Sub(processStart). Both operands
+// carry a monotonic reading (processStart because it too came from
+// time.Now()), so Sub uses the monotonic clock per the time package's rules.
+// On Linux that monotonic clock is CLOCK_MONOTONIC, which does not tick
+// across a suspend -- unlike the wall clock, which jumps forward by however
+// long the machine was asleep. That divergence between Now() and Mono() is
+// exactly the suspend signature Alarm.Run watches for.
+func (realClock) Mono() time.Duration { return time.Since(processStart) }
 
 // NewRealClock returns a Clock backed by time.Now.
 func NewRealClock() Clock { return realClock{} }
 
 // TestClock is a Clock whose time only moves when a test moves it.
 type TestClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu   sync.Mutex
+	now  time.Time
+	mono time.Duration
 }
 
-// NewTestClock returns a TestClock reading the given instant.
+// NewTestClock returns a TestClock reading the given instant, with its
+// monotonic counter starting at zero.
 func NewTestClock(t time.Time) *TestClock { return &TestClock{now: t} }
 
 func (c *TestClock) Now() time.Time {
@@ -33,14 +52,39 @@ func (c *TestClock) Now() time.Time {
 	return c.now
 }
 
-// Advance moves the clock forward by d. Use it to simulate suspend.
+// Mono returns the current monotonic reading. Only differences between two
+// calls are meaningful, matching realClock.Mono's contract.
+func (c *TestClock) Mono() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mono
+}
+
+// Advance moves the clock forward by d, wall and monotonic alike. Use it to
+// simulate ordinary time passing -- including a slow or starved tick, where
+// the process merely didn't get scheduled promptly. Both clocks still agree
+// on how much time passed, so this must never be mistaken for a suspend.
 func (c *TestClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+	c.mono += d
+}
+
+// Suspend moves the wall clock forward by d while leaving the monotonic
+// counter untouched. This is precisely what a sleeping laptop does: wall
+// time keeps passing (the RTC keeps ticking) while CLOCK_MONOTONIC does not.
+// It is the only way to reproduce, in a test, the wall/monotonic divergence
+// this entire application exists to detect and survive.
+func (c *TestClock) Suspend(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 }
 
-// Set jumps the clock to t. Use it to simulate an NTP step or a TZ change.
+// Set jumps the wall clock to t, leaving the monotonic counter unaffected.
+// Use it to simulate an NTP step, a manual clock change, or a TZ change --
+// none of which touch the monotonic clock either.
 func (c *TestClock) Set(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

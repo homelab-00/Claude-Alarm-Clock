@@ -65,23 +65,26 @@ type Alarm struct {
 	newTicker TickerFunc
 	out       chan Update
 
-	// initialWall is the wall clock reading (monotonic stripped, if any) at
-	// construction time. Run reads it exactly once, as its loop-local starting
-	// baseline, and never again -- from then on it is purely local state inside
-	// Run's single goroutine, so it needs no mutex.
+	// initialWall and initialMono are the wall and monotonic readings (wall's
+	// monotonic component stripped, if any) at construction time. Run reads
+	// them exactly once, as its loop-local starting baseline, and never again
+	// -- from then on they are purely local state inside Run's single
+	// goroutine, so they need no mutex.
 	//
-	// It must be captured here, in NewAlarm, rather than lazily as the first
+	// They must be captured here, in NewAlarm, rather than lazily as the first
 	// statement inside Run: Run executes in its own goroutine, started with
 	// `go a.Run(ctx)`, and the caller is free to mutate the Clock (e.g. a
-	// test's TestClock.Advance) immediately after that statement, before the
-	// goroutine has necessarily been scheduled. Reading a.clk.Now() lazily
-	// inside Run would race that mutation -- and losing the race silently
-	// produces a zero baseline delta, hiding exactly the suspend this package
-	// exists to detect. Capturing it here instead relies on the Go memory
-	// model's guarantee that a goroutine's `go` statement happens-before the
-	// spawned goroutine's execution: everything NewAlarm did, including this
-	// read, is visible to Run without further synchronization.
+	// test's TestClock.Advance or TestClock.Suspend) immediately after that
+	// statement, before the goroutine has necessarily been scheduled. Reading
+	// a.clk.Now()/Mono() lazily inside Run would race that mutation -- and
+	// losing the race silently produces a zero baseline delta, hiding exactly
+	// the suspend this package exists to detect. Capturing them here instead
+	// relies on the Go memory model's guarantee that a goroutine's `go`
+	// statement happens-before the spawned goroutine's execution: everything
+	// NewAlarm did, including these reads, is visible to Run without further
+	// synchronization.
 	initialWall time.Time
+	initialMono time.Duration
 
 	mu     sync.Mutex
 	armed  bool
@@ -98,6 +101,7 @@ func NewAlarm(clk Clock, period time.Duration, newTicker TickerFunc) *Alarm {
 		newTicker:   newTicker,
 		out:         make(chan Update),
 		initialWall: clk.Now().Round(0),
+		initialMono: clk.Mono(),
 	}
 }
 
@@ -136,21 +140,17 @@ func (a *Alarm) Run(ctx context.Context) {
 	tk := a.newTicker(a.period)
 	defer tk.Stop()
 
-	// lastWall is the wall clock (monotonic reading stripped, if any) as of the
-	// previous tick. We compare its delta against the ticker's own nominal
-	// period rather than against a second, independently-read monotonic clock:
-	// Clock is the seam tests use to fake wall time (TestClock.Advance jumps it
-	// instantly), and that fake has no real monotonic reading to diverge from
-	// -- a value built by time.Date, as every TestClock reading is, never
-	// carries one, so Round(0) is a no-op on it and a second a.clk.Now() call
-	// would agree with the first by construction. What IS real and unfakeable
-	// in both production and tests is the ticker's cadence: under normal
-	// operation a tick means "one period has elapsed", suspend or not. So
-	// "period" stands in for the expected monotonic delta, and DetectJump
-	// catches the case where the wall clock moved by far more (or less, or
-	// backwards) than that -- exactly the "wall advances, monotonic does not"
-	// suspend signature TestDetectJump documents.
+	// lastWall and lastMono are the wall and monotonic readings as of the
+	// previous tick. A suspend is detected by comparing how far each moved
+	// between ticks: under normal operation, including a merely late or
+	// starved tick, wall and monotonic advance together. A suspend is the one
+	// thing that moves wall time forward while CLOCK_MONOTONIC stands still
+	// (see realClock.Mono in clock.go), so DetectJump flags a divergence
+	// between the two deltas, not a deviation of either one from the nominal
+	// period. TestClock.Suspend is what reproduces that divergence in tests;
+	// TestClock.Advance moves both, precisely so it does NOT trip this check.
 	lastWall := a.initialWall
+	lastMono := a.initialMono
 
 	for {
 		select {
@@ -159,13 +159,14 @@ func (a *Alarm) Run(ctx context.Context) {
 
 		case <-tk.C():
 			now := a.clk.Now().Round(0)
+			mono := a.clk.Mono()
 
-			if jump, jumped := DetectJump(now.Sub(lastWall), a.period, a.period); jumped {
+			if jump, jumped := DetectJump(now.Sub(lastWall), mono-lastMono, a.period); jumped {
 				if !a.emit(ctx, Update{Kind: EventJump, Now: now, Jump: jump}) {
 					return
 				}
 			}
-			lastWall = now
+			lastWall, lastMono = now, mono
 
 			armed, fireAt, target, grace := a.snapshot()
 			if !armed {

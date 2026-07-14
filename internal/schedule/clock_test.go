@@ -38,6 +38,43 @@ func TestTestClockIsRaceSafe(t *testing.T) {
 	<-done
 }
 
+// Advance is ordinary time passing: both the wall clock and the monotonic
+// counter move forward by the same amount, so they never diverge.
+func TestTestClockAdvanceMovesWallAndMono(t *testing.T) {
+	start := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	c := NewTestClock(start)
+
+	wallBefore, monoBefore := c.Now(), c.Mono()
+	c.Advance(90 * time.Minute)
+
+	if got, want := c.Now(), wallBefore.Add(90*time.Minute); !got.Equal(want) {
+		t.Fatalf("after Advance, Now() = %v, want %v", got, want)
+	}
+	if got, want := c.Mono(), monoBefore+90*time.Minute; got != want {
+		t.Fatalf("after Advance, Mono() = %v, want %v", got, want)
+	}
+}
+
+// Suspend is what a sleeping laptop does: wall time jumps forward but the
+// monotonic counter does not move at all. This is the only TestClock method
+// that can reproduce, in a unit test, the wall/monotonic divergence that a
+// real suspend produces -- which is the entire bug this application exists
+// to survive.
+func TestTestClockSuspendMovesWallNotMono(t *testing.T) {
+	start := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	c := NewTestClock(start)
+
+	monoBefore := c.Mono()
+	c.Suspend(12*time.Hour + 30*time.Minute)
+
+	if got, want := c.Now(), start.Add(12*time.Hour+30*time.Minute); !got.Equal(want) {
+		t.Fatalf("after Suspend, Now() = %v, want %v", got, want)
+	}
+	if got := c.Mono(); got != monoBefore {
+		t.Fatalf("after Suspend, Mono() = %v, want unchanged %v", got, monoBefore)
+	}
+}
+
 func TestManualTickerDeliversTicks(t *testing.T) {
 	mt := NewManualTicker()
 	defer mt.Stop()
