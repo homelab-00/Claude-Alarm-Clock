@@ -7,6 +7,18 @@ import (
 	"claudealarm/internal/app"
 )
 
+// trayHost is the slice of desktop.App that InstallTray actually uses.
+//
+// Narrowed deliberately so the menu can be tested without a real desktop
+// driver: Fyne's test app does not implement desktop.App, which would leave
+// the menu construction -- including the load-bearing quit.IsQuit = true --
+// impossible to exercise from a test binary. desktop.App satisfies this.
+type trayHost interface {
+	SetSystemTrayMenu(*fyne.Menu)
+	SetSystemTrayIcon(fyne.Resource)
+	SetSystemTrayWindow(fyne.Window)
+}
+
 // InstallTray registers the system tray icon and menu. It reports whether a
 // tray was actually installed.
 //
@@ -24,8 +36,14 @@ func InstallTray(a fyne.App, w fyne.Window, core *app.Core, icon fyne.Resource) 
 	if !ok {
 		return false
 	}
+	installTrayOn(desk, w, core, icon)
+	return true
+}
 
-	quit := fyne.NewMenuItem("Quit", func() { a.Quit() })
+// installTrayOn builds the menu and wires it to host. Split out from
+// InstallTray so it can be exercised with a fake trayHost in tests.
+func installTrayOn(host trayHost, w fyne.Window, core *app.Core, icon fyne.Resource) {
+	quit := fyne.NewMenuItem("Quit", func() { fyne.CurrentApp().Quit() })
 	// Without IsQuit, Fyne appends its OWN Quit item, which calls App.Quit()
 	// directly and skips anything we wanted to do first.
 	quit.IsQuit = true
@@ -44,15 +62,13 @@ func InstallTray(a fyne.App, w fyne.Window, core *app.Core, icon fyne.Resource) 
 		quit,
 	)
 
-	desk.SetSystemTrayMenu(menu)
+	host.SetSystemTrayMenu(menu)
 	if icon != nil {
 		// Must be a plain full-colour PNG. A theme.ThemedResource routes to
 		// SetTemplateIcon, which is a macOS-only path and useless on Linux.
-		desk.SetSystemTrayIcon(icon)
+		host.SetSystemTrayIcon(icon)
 	}
-	desk.SetSystemTrayWindow(w)
-
-	return true
+	host.SetSystemTrayWindow(w)
 }
 
 // closableWindow is the slice of fyne.Window that KeepAliveOnClose needs.

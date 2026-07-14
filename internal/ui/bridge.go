@@ -8,6 +8,11 @@ import (
 	"claudealarm/internal/app"
 )
 
+// dispatcher queues fn onto the Fyne goroutine and returns immediately.
+// Production always passes fyne.Do; tests pass a fake that lets pump's
+// crossing behaviour be verified without a real Fyne driver.
+type dispatcher func(fn func())
+
 // Bridge pumps the Core's events onto the Fyne goroutine.
 //
 // This is the ONLY place in the codebase that calls fyne.Do, and it is the only
@@ -24,12 +29,22 @@ import (
 // blocking here would stall the Core, and calling DoAndWait from the main
 // goroutine is a genuine deadlock.
 func Bridge(ctx context.Context, core *app.Core, win *Window) {
+	pump(ctx, core.Events(), win.Apply, fyne.Do)
+}
+
+// pump is the testable core of Bridge: every event crosses to the UI through
+// do, never by calling apply directly. That indirection is what keeps
+// apply's widget writes on the Fyne goroutine -- see the doc comment on
+// Bridge for why that boundary matters and why do must never be
+// fyne.DoAndWait (queue and block): blocking here would stall the Core, and
+// DoAndWait from the main goroutine is a genuine deadlock.
+func pump(ctx context.Context, events <-chan app.Event, apply func(app.Event), do dispatcher) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
-		case e, ok := <-core.Events():
+		case e, ok := <-events:
 			if !ok {
 				return
 			}
@@ -37,7 +52,7 @@ func Bridge(ctx context.Context, core *app.Core, win *Window) {
 			// select iteration declares it anew), so the closure below
 			// captures this iteration's value safely without a manual
 			// shadow copy.
-			fyne.Do(func() { win.Apply(e) })
+			do(func() { apply(e) })
 		}
 	}
 }
