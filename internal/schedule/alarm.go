@@ -91,6 +91,29 @@ type Alarm struct {
 	fireAt time.Time
 	target time.Time
 	grace  time.Duration
+
+	// beforeDisarm, if set, is called by Run immediately after it decides to
+	// fire or report an alarm missed, but before it attempts to clear the
+	// pending alarm. Production code never sets it, so it costs one nil
+	// check per fire/missed tick.
+	//
+	// It exists solely so a test can force the TOCTOU gap that
+	// disarmIfStill closes: Run reads state under the lock (snapshot),
+	// releases it, calls Decide, and only THEN re-acquires the lock to
+	// clear the alarm. A concurrent Arm from the UI goroutine can land in
+	// that gap. There is no channel operation in that gap to block a test
+	// on -- Decide is pure and returns synchronously -- so without this
+	// hook the interleaving can only be hit by chance under scheduler
+	// preemption, which is exactly the non-deterministic test this project
+	// has already rejected twice. Setting beforeDisarm to a function that
+	// blocks lets a test pause the loop here on purpose. See
+	// TestAlarmRearmDuringFireIsNotClobbered in alarm_test.go.
+	//
+	// Like initialWall/initialMono above, it needs no mutex: a test sets it
+	// before calling `go a.Run(ctx)`, and only Run's own goroutine ever
+	// reads or clears it afterward, so the go-statement happens-before
+	// guarantee alone makes this safe.
+	beforeDisarm func()
 }
 
 // NewAlarm returns an Alarm. Call Run in a goroutine to start it.
@@ -187,7 +210,19 @@ func (a *Alarm) Run(ctx context.Context) {
 				}
 
 			case DecideFire:
-				a.Disarm() // before emitting, so we cannot fire twice
+				if a.beforeDisarm != nil {
+					a.beforeDisarm()
+				}
+				if !a.disarmIfStill(fireAt) {
+					// A concurrent Arm landed between snapshot() and here:
+					// the alarm we just decided to fire has already been
+					// replaced by a new one. Firing now would run the job
+					// for an alarm the user no longer has pending, and
+					// clearing unconditionally would silently throw the new
+					// one away. Do neither -- let the new alarm be judged
+					// fresh on its own next tick.
+					continue
+				}
 				if !a.emit(ctx, Update{
 					Kind: EventFire, Now: now,
 					FireAt: fireAt, Target: target,
@@ -196,7 +231,12 @@ func (a *Alarm) Run(ctx context.Context) {
 				}
 
 			case DecideMissed:
-				a.Disarm()
+				if a.beforeDisarm != nil {
+					a.beforeDisarm()
+				}
+				if !a.disarmIfStill(fireAt) {
+					continue // superseded by a concurrent Arm; see DecideFire above
+				}
 				if !a.emit(ctx, Update{
 					Kind: EventMissed, Now: now,
 					FireAt: fireAt, Target: target,
@@ -213,6 +253,29 @@ func (a *Alarm) snapshot() (bool, time.Time, time.Time, time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.armed, a.fireAt, a.target, a.grace
+}
+
+// disarmIfStill clears the pending alarm only if fireAt is still the instant
+// the caller decided to act on, and reports whether it did.
+//
+// Run reads state under the lock (snapshot), releases it to call the pure
+// Decide, and only then comes back to clear the alarm. Between those two
+// moments the UI goroutine may have called Arm with a NEW fire time -- and an
+// unconditional clear would silently discard it: a lost update that no error
+// ever surfaces. Comparing fireAt before clearing is what makes it safe for the
+// loop to run alongside a user who re-arms: if the pending alarm no longer
+// matches what was decided on, it has already been superseded, so this
+// leaves it alone and reports false instead.
+func (a *Alarm) disarmIfStill(fireAt time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.armed || !a.fireAt.Equal(fireAt) {
+		return false // superseded by a concurrent Arm; leave it alone
+	}
+	a.armed = false
+	a.fireAt = time.Time{}
+	a.target = time.Time{}
+	return true
 }
 
 // emit sends u, or reports false if ctx was cancelled while we waited.

@@ -286,6 +286,97 @@ func TestAlarmRunStopsOnContextCancel(t *testing.T) {
 // alarm.go code this task introduces (EventKind.String, and emit's
 // ctx-cancellation path) that the verbatim suite does not happen to reach.
 
+// TestAlarmRearmDuringFireIsNotClobbered reproduces the TOCTOU lost-update
+// race: Run reads state (snapshot), releases the lock, calls the pure
+// Decide, and only THEN re-acquires the lock to clear the alarm. If a
+// concurrent Arm from another goroutine (the UI thread, in production) lands
+// in that gap, an unconditional clear would silently throw the NEW alarm
+// away -- Armed() would report false, no event would ever be emitted for it,
+// and the user would get no error.
+//
+// There is no channel operation in that gap to block on naturally, so the
+// interleaving cannot be forced by ordinary goroutine scheduling -- hitting
+// it would require relying on preemption, which is exactly the kind of
+// unfalsifiable, timing-based test this project has already rejected twice.
+// Instead this test uses the beforeDisarm hook to pause the loop deterministically
+// exactly inside the gap: the loop reaches beforeDisarm only after Decide has
+// already concluded DecideFire, and it cannot proceed to disarmIfStill until
+// this test releases it. The concurrent Arm is issued while the loop is
+// provably paused there, not merely "probably" paused there.
+func TestAlarmRearmDuringFireIsNotClobbered(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.UTC)
+	clk := NewTestClock(start)
+	mt := NewManualTicker()
+	a := NewAlarm(clk, time.Second, func(time.Duration) Ticker { return mt })
+
+	oldFire := start.Add(2 * time.Second)
+	oldTarget := start.Add(time.Hour)
+	a.Arm(oldFire, oldTarget, time.Minute)
+
+	newFire := start.Add(20 * time.Second)
+	newTarget := start.Add(2 * time.Hour)
+
+	reachedGap := make(chan struct{})
+	proceed := make(chan struct{})
+	// Set before `go a.Run(ctx)`: the happens-before guarantee of the go
+	// statement is what makes this safe to read from Run's goroutine without
+	// a mutex (see the field's doc comment in alarm.go).
+	a.beforeDisarm = func() {
+		close(reachedGap)
+		<-proceed
+		// Self-clear so the SECOND fire (of the new alarm, later in this
+		// test) runs the unmodified fast path instead of re-entering this
+		// hook. Safe without a mutex: only Run's own goroutine ever calls or
+		// clears this field once Run has started.
+		a.beforeDisarm = nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go a.Run(ctx)
+
+	clk.Advance(2 * time.Second) // now lands exactly on oldFire
+	mt.Tick()                    // returns once the loop's select receives it
+
+	<-reachedGap // the loop has decided DecideFire for oldFire and is paused
+
+	// The re-arm, issued while the loop is provably stuck between deciding
+	// to fire and clearing -- the exact TOCTOU window.
+	a.Arm(newFire, newTarget, time.Minute)
+
+	close(proceed) // release the loop to attempt disarmIfStill(oldFire)
+
+	// The old, superseded fire must NOT be emitted: the alarm it referred to
+	// no longer exists by the time the loop resumed.
+	select {
+	case u := <-a.Updates():
+		t.Fatalf("got an emitted update for the superseded old alarm: %+v", u)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The new alarm, armed mid-race, must have survived intact.
+	armed, fireAt, target := a.Armed()
+	if !armed {
+		t.Fatal("alarm disarmed after a concurrent re-arm during a fire; the new alarm was lost")
+	}
+	if !fireAt.Equal(newFire) || !target.Equal(newTarget) {
+		t.Fatalf("Armed() = (%v, %v), want the NEW alarm (%v, %v)", fireAt, target, newFire, newTarget)
+	}
+
+	// And it must still fire, on its own schedule.
+	clk.Advance(18 * time.Second) // now lands exactly on newFire
+	mt.Tick()
+
+	select {
+	case u := <-a.Updates():
+		if u.Kind != EventFire || !u.FireAt.Equal(newFire) || !u.Target.Equal(newTarget) {
+			t.Fatalf("got %+v, want EventFire at %v for %v", u, newFire, newTarget)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the new alarm never fired")
+	}
+}
+
 func TestEventKindString(t *testing.T) {
 	tests := []struct {
 		k    EventKind
