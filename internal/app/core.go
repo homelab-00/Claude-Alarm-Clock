@@ -7,6 +7,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -51,6 +52,14 @@ type Event struct {
 	Status Status
 	Now    time.Time
 
+	// ClockOnly marks a tick whose only meaningful field is Now: the clock
+	// face must keep advancing every second, including for the entire
+	// duration of a run and after a terminal status (Done/Missed/Error),
+	// but a tick must never clobber a terminal status/result with the
+	// zeroed-out fields a bare tick carries. The UI updates the clock
+	// unconditionally and otherwise ignores a ClockOnly event.
+	ClockOnly bool
+
 	FireAt    time.Time
 	Target    time.Time
 	Remaining time.Duration // StatusArmed: until FireAt
@@ -69,16 +78,18 @@ type Core struct {
 
 	out chan Event
 
-	mu     sync.Mutex
-	state  config.State
-	status Status
-	ctx    context.Context // set by Run; bounds the blocking terminal-event sends below
+	mu      sync.Mutex
+	state   config.State
+	status  Status
+	running bool            // guards fire(); see tryBeginRun/endRun
+	ctx     context.Context // set by Run; bounds the blocking terminal-event sends below
 }
 
 // New returns a Core. Call Run in a goroutine, and run the Alarm too.
 func New(clk schedule.Clock, al *schedule.Alarm, r runner.Runner, st config.Store) *Core {
 	loaded, err := st.Load()
 	if err != nil {
+		log.Printf("app: failed to load persisted state, falling back to defaults: %v", err)
 		loaded = config.DefaultState(".")
 	}
 	return &Core{
@@ -146,6 +157,13 @@ func (c *Core) Arm(st config.State) error {
 	// grace -- see the doc comment.
 	if !now.Round(0).Before(fire.Round(0)) {
 		c.alarm.Disarm()
+		// Every other path that decides to fire persists the disarm before
+		// firing (see EventFire and Restore's DecideFire below). This path
+		// must too: without it, Armed=true and a stale FireAt survive in
+		// preferences.json, so a restart within the grace window re-fires
+		// an alarm that already ran, and any later restart reports a false
+		// MISSED for one that succeeded.
+		c.disarmAndPersist()
 		go c.fire(context.Background(), fire, target)
 		return nil
 	}
@@ -246,8 +264,17 @@ func (c *Core) Run(ctx context.Context) {
 						Status: StatusArmed, Now: u.Now,
 						FireAt: u.FireAt, Target: u.Target, Remaining: u.Remaining,
 					})
-				} else if c.currentStatus() == StatusIdle {
-					c.emit(Event{Status: StatusIdle, Now: u.Now})
+				} else {
+					// Not armed: idle, running, or resting on a terminal
+					// status (Done/Missed/Error) after firing. The clock is
+					// the app's headline widget and must keep advancing in
+					// every one of those states -- including for the whole
+					// duration of a run, up to 120s -- or it reads as a
+					// hung app. ClockOnly tells the UI to move the clock
+					// and touch nothing else, so a tick can never clobber a
+					// terminal status/result with its own zeroed-out
+					// fields.
+					c.emit(Event{Status: c.currentStatus(), Now: u.Now, ClockOnly: true})
 				}
 
 			case schedule.EventFire:
@@ -267,7 +294,20 @@ func (c *Core) Run(ctx context.Context) {
 }
 
 // fire runs claude and reports the outcome.
+//
+// Guarded by tryBeginRun/endRun so two overlapping calls -- most plausibly a
+// double-click on "Run now", or an alarm firing while a manual run is still
+// in flight -- can never spawn two concurrent, separately billed Claude
+// invocations. Every fire path (Arm's immediate-fire branch, Restore,
+// EventFire, RunNow) goes through here, so the guard protects all of them
+// uniformly.
 func (c *Core) fire(ctx context.Context, fireAt, target time.Time) {
+	if !c.tryBeginRun() {
+		log.Printf("app: fire() called while a run was already in flight; ignoring")
+		return
+	}
+	defer c.endRun()
+
 	st := c.State()
 
 	bin, err := runner.Lookup()
@@ -305,7 +345,36 @@ func (c *Core) disarmAndPersist() {
 	c.state.Target = time.Time{}
 	st := c.state
 	c.mu.Unlock()
-	_ = c.store.Save(st)
+	if err := c.store.Save(st); err != nil {
+		log.Printf("app: failed to persist disarm: %v", err)
+	}
+}
+
+// tryBeginRun claims the exclusive right to invoke Claude. It reports false if
+// a run is already in flight.
+//
+// Every path into fire() goes through here: the Run-now button, Arm's
+// immediate-fire branch, EventFire, and Restore's DecideFire. Two concurrent
+// invocations would be two separately-billed API calls, and two racing
+// StatusRunning->StatusDone sequences whose results would fight over the UI.
+func (c *Core) tryBeginRun() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running {
+		return false
+	}
+	c.running = true
+	return true
+}
+
+// endRun releases the claim taken by tryBeginRun, so a later fire (the alarm,
+// or another press of Run now) is free to proceed. Must run via defer
+// immediately after a successful tryBeginRun -- see fire -- so the claim is
+// never left latched after a run ends, however it ends.
+func (c *Core) endRun() {
+	c.mu.Lock()
+	c.running = false
+	c.mu.Unlock()
 }
 
 func (c *Core) setStatus(s Status) {

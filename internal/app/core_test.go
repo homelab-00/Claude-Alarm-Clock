@@ -99,6 +99,13 @@ func TestCoreArmThenFireRunsClaudeOnce(t *testing.T) {
 	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
 	r := newRig(t, start)
 
+	// Capture the exact WorkDir the rig's store was seeded with -- arming
+	// never touches WorkDir, so this is exactly what must reach the runner.
+	wantDir := r.store.MustLoad().WorkDir
+	if wantDir == "" {
+		t.Fatal("test setup: rig's default state has an empty WorkDir")
+	}
+
 	// Target 07:30, offset 20m -> fire at 07:10, ten minutes away.
 	r.armed(schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute})
 
@@ -125,8 +132,12 @@ func TestCoreArmThenFireRunsClaudeOnce(t *testing.T) {
 	if call.Model != "haiku" {
 		t.Fatalf("model = %q, want haiku", call.Model)
 	}
-	if call.WorkDir == "" {
-		t.Fatal("WorkDir was not passed to the runner")
+	// Not just non-empty: exactly the directory the user configured.
+	// Mutating Core.fire to pass a different WorkDir (e.g. "/") would run
+	// Claude in the wrong directory, and the old `!= ""` check let that
+	// regression through silently.
+	if call.WorkDir != wantDir {
+		t.Fatalf("WorkDir = %q, want %q", call.WorkDir, wantDir)
 	}
 
 	// The result reaches the UI.
@@ -187,6 +198,18 @@ func TestCoreArmWithFireTimeAlreadyPastFiresImmediatelyIgnoringGrace(t *testing.
 
 	r.armed(schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute})
 
+	// Arm's immediate-fire branch must persist the disarm synchronously, just
+	// like every other path that decides to fire (see
+	// TestCoreDoesNotRearmItselfAfterFiring for the equivalent assertion on
+	// the normal path). Arm() does this before returning, so it can be
+	// checked immediately -- no need to wait for the fire itself to land.
+	// Without it, Armed=true and a stale FireAt survive in the store, and a
+	// restart within the grace window replays the alarm: see
+	// TestCoreRestoreAfterArmWithPastFireTimeDoesNotFireAgain below.
+	if st := r.store.MustLoad(); st.Armed {
+		t.Fatal("Arm's immediate-fire path did not persist the disarm; the store still says Armed = true")
+	}
+
 	// Give the immediate run a moment to land.
 	got := r.step(time.Second)
 
@@ -195,6 +218,70 @@ func TestCoreArmWithFireTimeAlreadyPastFiresImmediatelyIgnoringGrace(t *testing.
 	}
 	if !hasStatus(got, StatusDone) && !hasStatus(got, StatusRunning) {
 		t.Fatalf("want Running or Done, got %v", got)
+	}
+}
+
+// The double-fire scenario from the final review: arm a target whose fire
+// time has already passed (fires immediately, per the test above), quit, and
+// reopen within the grace window. If the immediate-fire branch had not
+// persisted its disarm, Restore would find Armed=true with a stale FireAt
+// still just inside the grace window, decide DecideFire all over again, and
+// run Claude a second time -- unrequested, and paid for twice.
+func TestCoreRestoreAfterArmWithPastFireTimeDoesNotFireAgain(t *testing.T) {
+	clk := schedule.NewTestClock(time.Date(2026, 7, 14, 7, 12, 0, 0, time.Local))
+	store := config.NewMemStore(config.DefaultState(t.TempDir()))
+
+	// First "session": arm a 07:30 target with a 20m lead-in at 07:12. The
+	// fire time (07:10) is two minutes gone, so Arm fires it immediately.
+	mt1 := schedule.NewManualTicker()
+	alarm1 := schedule.NewAlarm(clk, time.Second, func(time.Duration) schedule.Ticker { return mt1 })
+	fake1 := &runner.Fake{Result: runner.Result{Text: "first run"}}
+	core1 := New(clk, alarm1, fake1, store)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go alarm1.Run(ctx1)
+	go core1.Run(ctx1)
+
+	st := store.MustLoad()
+	st.Spec = schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute}
+	if err := core1.Arm(st); err != nil {
+		t.Fatalf("Arm() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for fake1.CallCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if fake1.CallCount() != 1 {
+		t.Fatalf("setup: claude ran %d times on the immediate fire, want 1", fake1.CallCount())
+	}
+	cancel1() // "quit" the app
+
+	// The user reopens the app a minute later, at 07:13 -- three minutes past
+	// the 07:10 fire time, inside the 5-minute grace window. A second Core,
+	// backed by the SAME store, stands in for the new process.
+	clk.Advance(1 * time.Minute)
+
+	mt2 := schedule.NewManualTicker()
+	alarm2 := schedule.NewAlarm(clk, time.Second, func(time.Duration) schedule.Ticker { return mt2 })
+	fake2 := &runner.Fake{Result: runner.Result{Text: "second run"}}
+	core2 := New(clk, alarm2, fake2, store)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go alarm2.Run(ctx2)
+	go core2.Run(ctx2)
+	t.Cleanup(cancel2)
+
+	if err := core2.Restore(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give a wrongly-firing Restore a moment to land.
+	time.Sleep(200 * time.Millisecond)
+
+	if fake2.CallCount() != 0 {
+		t.Fatalf("claude ran %d times on restart within the grace window; the first run's disarm was not persisted, "+
+			"so Restore replayed the alarm and paid for a second, unrequested invocation", fake2.CallCount())
 	}
 }
 
@@ -297,7 +384,17 @@ func TestCoreDisarmStopsIt(t *testing.T) {
 	r.armed(schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute})
 	r.core.Disarm()
 
-	r.step(30 * time.Minute)
+	// Fire time is 07:10, grace is 5m (window closes 07:15). Advance to
+	// 10m1s -- ONE SECOND past the fire time, well INSIDE the grace window
+	// -- not past it. This is deliberate: at 30m past (as this test
+	// previously advanced), even a live Alarm that Disarm forgot to stop
+	// would land past its own grace window and report MISSED without
+	// running Claude, so the assertions below would pass regardless of
+	// whether Disarm actually stopped anything. Landing inside the grace
+	// window is what makes a broken Disarm (c.alarm.Disarm() removed from
+	// Core.Disarm) actually cause Claude to run, which is the only way this
+	// test can catch that regression.
+	r.step(10*time.Minute + time.Second)
 
 	if r.fake.CallCount() != 0 {
 		t.Fatal("a disarmed alarm fired")
@@ -426,5 +523,173 @@ func TestCoreTerminalEventIsNotDroppedWhenTheChannelIsFull(t *testing.T) {
 		case <-deadline:
 			t.Fatal("StatusDone never arrived after the channel had room; it was dropped")
 		}
+	}
+}
+
+// EventTick used to only ever produce an Event when the alarm was armed, or
+// when the status was exactly StatusIdle -- so the clock froze solid for the
+// entire duration of a run (StatusRunning, up to 120s). This proves ticks
+// keep arriving, marked ClockOnly, while Claude is running.
+func TestCoreTicksContinueDuringARunWithoutFreezingTheClock(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
+	r := newRig(t, start)
+	r.fake.Delay = 500 * time.Millisecond // hold StatusRunning open
+
+	r.armed(schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute})
+
+	r.clk.Advance(10 * time.Minute)
+	r.tick.Tick()
+
+	// Wait for the genuine StatusRunning event (not a tick) to land -- do not
+	// wait for StatusDone, since the fake is deliberately still "running".
+	deadline := time.After(2 * time.Second)
+runningLoop:
+	for {
+		select {
+		case e := <-r.core.Events():
+			if e.Status == StatusRunning && !e.ClockOnly {
+				break runningLoop
+			}
+		case <-deadline:
+			t.Fatal("StatusRunning never arrived")
+		}
+	}
+
+	// Tick once more while the run is still in flight. The old code only
+	// ever emitted an Event when armed or exactly StatusIdle -- Running
+	// matches neither, so the clock froze here.
+	r.clk.Advance(time.Second)
+	r.tick.Tick()
+
+	select {
+	case e := <-r.core.Events():
+		if e.Now.IsZero() {
+			t.Fatal("tick during a run carried a zero Now; the clock cannot advance")
+		}
+		if !e.ClockOnly {
+			t.Fatalf("tick during a run must be marked ClockOnly, got %+v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no event delivered for a tick during a run; the clock face has frozen mid-run")
+	}
+}
+
+// After a terminal status, the poll loop must keep delivering ticks -- the
+// clock must not freeze forever just because the alarm already fired -- but
+// a tick must never clobber the terminal status/result it is resting on. See
+// TestWindowClockOnlyTickDoesNotOverwriteDoneText for the UI-side half of
+// this contract.
+func TestCoreTicksAfterDoneStillDeliverNowAsClockOnly(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
+	r := newRig(t, start)
+
+	r.armed(schedule.Spec{Hour: 7, Minute: 30, Offset: 20 * time.Minute, Grace: 5 * time.Minute})
+	got := r.step(10 * time.Minute) // fires -> StatusDone
+	if !hasStatus(got, StatusDone) {
+		t.Fatalf("want StatusDone after firing, got %v", got)
+	}
+
+	next := r.step(time.Second)
+	if len(next) == 0 {
+		t.Fatal("no event delivered on the tick after a terminal status; the clock face has frozen")
+	}
+	last := next[len(next)-1]
+	if last.Now.IsZero() {
+		t.Fatal("tick after Done carried a zero Now; the clock cannot advance")
+	}
+	if !last.ClockOnly {
+		t.Fatalf("tick after a terminal status must be marked ClockOnly so the UI cannot re-render it as a fresh "+
+			"Done event, got %+v", last)
+	}
+	if last.Result.Text != "" {
+		t.Fatalf("a ClockOnly tick must not carry a stale/zeroed Result, got %+v", last.Result)
+	}
+}
+
+// waitForCallCount polls fake.CallCount() until it reaches at least n. Unlike
+// a fixed sleep, this cannot produce a false pass by guessing too short a
+// duration: it only returns once the condition is genuinely true (runner.Fake
+// records a call BEFORE blocking on Delay, so CallCount() >= n is proof the
+// nth call has entered Run -- not a guess that it probably has by now).
+func waitForCallCount(t *testing.T, fake *runner.Fake, n int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if fake.CallCount() >= n {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for CallCount() to reach %d, got %d", n, fake.CallCount())
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// waitForStatus drains r.core.Events() until a non-ClockOnly event with the
+// given status arrives, or fails the test after a generous timeout.
+func waitForStatus(t *testing.T, r *rig, want Status) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case e := <-r.core.Events():
+			if e.Status == want && !e.ClockOnly {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for status %v", want)
+		}
+	}
+}
+
+// Two overlapping invocations of fire -- e.g. a double click on the "Run now"
+// button, or an alarm firing while a manual run is still in flight -- must
+// not spawn two concurrent, separately billed Claude invocations.
+//
+// This is made deterministic, not timing-dependent: runner.Fake.Delay holds
+// the first call open, and waitForCallCount proves (rather than assumes) that
+// the first call has genuinely entered Run -- and therefore that the guard is
+// held -- before the second RunNow is issued. A fixed sleep here would be the
+// ninth test in this project that could pass or fail by luck rather than by
+// the property it claims to check.
+func TestCoreFireIgnoresASecondInvocationWhileARunIsInFlight(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
+	r := newRig(t, start)
+	r.fake.Delay = 200 * time.Millisecond
+
+	r.core.RunNow()
+	waitForCallCount(t, r.fake, 1) // proves the first call holds the guard
+
+	r.core.RunNow() // must be turned away: a run is already in flight
+
+	waitForStatus(t, r, StatusDone) // let the one legitimate run finish
+
+	if r.fake.CallCount() != 1 {
+		t.Fatalf("claude ran %d times from two overlapping RunNow calls, want 1", r.fake.CallCount())
+	}
+}
+
+// The guard must not latch permanently. A naive `if c.running { return }`
+// with a missed reset on some exit path would pass the test above yet
+// silently disable Run now (and every alarm fire) forever after the first
+// invocation -- a regression far worse than the double-fire bug it was meant
+// to prevent. This proves the guard releases: a second, later, non-concurrent
+// RunNow after the first genuinely completes must still invoke Claude.
+func TestCoreFireAcceptsANewRunAfterThePreviousOneCompletes(t *testing.T) {
+	start := time.Date(2026, 7, 14, 7, 0, 0, 0, time.Local)
+	r := newRig(t, start)
+
+	r.core.RunNow()
+	waitForStatus(t, r, StatusDone)
+	if r.fake.CallCount() != 1 {
+		t.Fatalf("claude ran %d times on the first RunNow, want 1", r.fake.CallCount())
+	}
+
+	r.core.RunNow()
+	waitForStatus(t, r, StatusDone)
+	if r.fake.CallCount() != 2 {
+		t.Fatalf("claude ran %d times after two sequential, non-overlapping RunNow calls, want 2: "+
+			"the guard must release once a run completes, not latch forever", r.fake.CallCount())
 	}
 }
