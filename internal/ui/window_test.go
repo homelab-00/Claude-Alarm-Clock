@@ -59,7 +59,7 @@ func TestWindowHeroShowsFireTimeWhenIdle(t *testing.T) {
 	w := newTestWindow(t)
 
 	w.timeEntry.SetText("07:30")
-	w.offsetEntry.SetText("5")
+	w.offsetEntry.SetText("00:05")
 	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
 
 	fire, _ := wantFireTime(t, 7, 30, 5*time.Minute)
@@ -126,7 +126,7 @@ func TestWindowExplainerNamesFireTimeLeadInAndTarget(t *testing.T) {
 	w := newTestWindow(t)
 
 	w.timeEntry.SetText("07:30")
-	w.offsetEntry.SetText("5")
+	w.offsetEntry.SetText("00:05")
 	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
 
 	fire, target := wantFireTime(t, 7, 30, 5*time.Minute)
@@ -134,7 +134,7 @@ func TestWindowExplainerNamesFireTimeLeadInAndTarget(t *testing.T) {
 	if !strings.Contains(text, fire.Format("15:04")) {
 		t.Fatalf("explainer = %q, want it to name the fire time %s", text, fire.Format("15:04"))
 	}
-	if !strings.Contains(text, "5 min") {
+	if !strings.Contains(text, "5m before") {
 		t.Fatalf("explainer = %q, want it to name the 5 minute lead-in", text)
 	}
 	if !strings.Contains(text, target.Format("15:04")) {
@@ -143,19 +143,19 @@ func TestWindowExplainerNamesFireTimeLeadInAndTarget(t *testing.T) {
 }
 
 // A zero lead-in is a real, valid configuration (fire exactly at the
-// target); the explainer must say so in words rather than "0 min before".
+// target); the explainer must say so in words rather than "0m before".
 func TestWindowExplainerZeroLeadInSaysExactlyAtTarget(t *testing.T) {
 	w := newTestWindow(t)
 
 	w.timeEntry.SetText("07:30")
-	w.offsetEntry.SetText("0")
+	w.offsetEntry.SetText("00:00")
 	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
 
 	if !strings.Contains(w.explainer.Text, "exactly at your target") {
 		t.Fatalf("explainer = %q, want it to say \"exactly at your target\" for a zero lead-in", w.explainer.Text)
 	}
-	if strings.Contains(w.explainer.Text, "0 min before") {
-		t.Fatalf("explainer = %q, must not say \"0 min before\"", w.explainer.Text)
+	if strings.Contains(w.explainer.Text, "0m before") {
+		t.Fatalf("explainer = %q, must not say \"0m before\"", w.explainer.Text)
 	}
 }
 
@@ -174,8 +174,8 @@ func TestWindowExplainerWhileArmedNamesFireTimeAndTargetWithoutInSuffix(t *testi
 	})
 
 	text := w.explainer.Text
-	if !strings.Contains(text, "07:25") || !strings.Contains(text, "5 min") || !strings.Contains(text, "07:30") {
-		t.Fatalf("explainer = %q, want it to name fire time 07:25, the 5 min lead-in, and the 07:30 target", text)
+	if !strings.Contains(text, "07:25") || !strings.Contains(text, "5m before") || !strings.Contains(text, "07:30") {
+		t.Fatalf("explainer = %q, want it to name fire time 07:25, the 5m lead-in, and the 07:30 target", text)
 	}
 	if strings.Contains(text, "(in ") {
 		t.Fatalf("explainer = %q, must not repeat the \"(in ...)\" suffix while armed (the hero is already a live countdown)", text)
@@ -222,7 +222,7 @@ func TestWindowExplainerUpdatesLiveAsFormIsEdited(t *testing.T) {
 	w := newTestWindow(t)
 
 	w.timeEntry.SetText("09:00")
-	w.offsetEntry.SetText("10")
+	w.offsetEntry.SetText("00:10")
 	afterFirstEdit := w.explainer.Text
 
 	w.timeEntry.SetText("18:00")
@@ -422,17 +422,42 @@ func TestWindowTimeEntryValidatorMatchesParseHHMM(t *testing.T) {
 	}
 }
 
-func TestWindowOffsetEntryRejectsNonNumeric(t *testing.T) {
+// The lead-in is entered as a duration on an HH:MM face, like the target time
+// above it -- "03:00" is three hours. A bare minute count is exactly the
+// spelling this replaced, so it must not quietly keep working: "180" would
+// otherwise be read as 1 hour 80 minutes, or as three hours, depending on who
+// is guessing.
+func TestWindowOffsetEntryValidatesHHMM(t *testing.T) {
 	w := newTestWindow(t)
 
-	w.offsetEntry.SetText("abc")
-	if err := w.offsetEntry.Validate(); err == nil {
-		t.Fatal("a non-numeric offset must not validate")
+	if err := w.offsetEntry.Validate(); err != nil {
+		t.Fatalf("the default lead-in must be valid: %v", err)
 	}
 
-	w.offsetEntry.SetText("20")
-	if err := w.offsetEntry.Validate(); err != nil {
-		t.Fatalf("20 must validate: %v", err)
+	for _, s := range []string{"03:00", "02:30", "00:00", "00:20", "23:59"} {
+		w.offsetEntry.SetText(s)
+		if err := w.offsetEntry.Validate(); err != nil {
+			t.Errorf("Validate(%q) = %v, want it to accept", s, err)
+		}
+	}
+
+	for _, s := range []string{"abc", "", "180", "20", "3:00", "24:00", "00:60"} {
+		w.offsetEntry.SetText(s)
+		if err := w.offsetEntry.Validate(); err == nil {
+			t.Errorf("Validate(%q) = nil, want it to reject", s)
+		}
+	}
+}
+
+// The entry is seeded from the persisted offset, and what it shows must be a
+// duration a human reads at a glance -- five minutes as "00:05", not "5".
+func TestWindowOffsetEntrySeedsFromPersistedOffsetAsHHMM(t *testing.T) {
+	w := newTestWindow(t)
+
+	// newTestWindow's core carries config.DefaultState, whose lead-in is
+	// config.DefaultOffset (5 minutes).
+	if got := w.offsetEntry.Text; got != "00:05" {
+		t.Fatalf("offsetEntry = %q, want the 5-minute default rendered as \"00:05\"", got)
 	}
 }
 
@@ -441,7 +466,7 @@ func TestWindowStateFromForm(t *testing.T) {
 	w := newTestWindow(t)
 
 	w.timeEntry.SetText("08:45")
-	w.offsetEntry.SetText("15")
+	w.offsetEntry.SetText("02:30")
 
 	st, err := w.stateFromForm()
 	if err != nil {
@@ -451,26 +476,99 @@ func TestWindowStateFromForm(t *testing.T) {
 	if st.Spec.Hour != 8 || st.Spec.Minute != 45 {
 		t.Fatalf("spec = %d:%d, want 8:45", st.Spec.Hour, st.Spec.Minute)
 	}
-	if st.Spec.Offset != 15*time.Minute {
-		t.Fatalf("offset = %v, want 15m", st.Spec.Offset)
+	if st.Spec.Offset != 2*time.Hour+30*time.Minute {
+		t.Fatalf("offset = %v, want 2h30m -- \"02:30\" is a duration, not 2 minutes 30 seconds", st.Spec.Offset)
 	}
 }
 
-// minutesValidator's upper bound (n >= 24*60) must be the single source of
-// truth for the offset field: stateFromForm used to re-derive the check and
-// omit that bound, so the widget marked "1500" invalid while Arm accepted it
-// anyway -- the same "two validators disagree" bug class as the time field.
-func TestWindowOffsetEntryUpperBoundMatchesStateFromForm(t *testing.T) {
+// Whatever the form produces must satisfy schedule.Spec.Validate, which bounds
+// the lead-in to [0, 24h). Entering it on an HH:MM face makes that automatic
+// (00:00-23:59 is exactly that range), and this pins it.
+func TestWindowStateFromFormProducesAValidSpec(t *testing.T) {
 	w := newTestWindow(t)
 
-	w.offsetEntry.SetText("1500")
-	if err := w.offsetEntry.Validate(); err == nil {
-		t.Fatal("1500 minutes (>= 24h) must not validate")
+	w.timeEntry.SetText("08:45")
+	for _, s := range []string{"00:00", "00:05", "03:00", "23:59"} {
+		w.offsetEntry.SetText(s)
+		st, err := w.stateFromForm()
+		if err != nil {
+			t.Errorf("stateFromForm with lead-in %q: %v", s, err)
+			continue
+		}
+		if err := st.Spec.Validate(); err != nil {
+			t.Errorf("lead-in %q produced a Spec that fails Validate: %v", s, err)
+		}
+	}
+}
+
+// parseLeadIn must be the single source of truth for the offset field:
+// stateFromForm used to re-derive the rules and omit the upper bound, so the
+// widget marked "1500" invalid while Arm accepted it anyway -- the same "two
+// validators disagree" bug class as the time field. Every input the widget
+// rejects, Arm must reject too.
+func TestWindowOffsetEntryValidatorMatchesStateFromForm(t *testing.T) {
+	w := newTestWindow(t)
+	w.timeEntry.SetText("07:30")
+
+	for _, s := range []string{"1500", "180", "24:00", "3:00", "abc"} {
+		w.offsetEntry.SetText(s)
+		if err := w.offsetEntry.Validate(); err == nil {
+			t.Errorf("Validate(%q) = nil, want the widget to reject it", s)
+		}
+		if _, err := w.stateFromForm(); err == nil {
+			t.Errorf("stateFromForm accepted lead-in %q that the widget rejects", s)
+		}
+	}
+}
+
+// A three-hour lead-in must read as three hours everywhere it appears. The
+// field says "03:00"; the sentence beneath the clock says "3h", not the "180
+// min" the user would otherwise have to divide in their head.
+func TestWindowExplainerNamesTheLeadInInHoursAndMinutes(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.timeEntry.SetText("12:00")
+	w.offsetEntry.SetText("03:00")
+	w.Apply(app.Event{Status: app.StatusIdle, Now: time.Now()})
+
+	if !strings.Contains(w.explainer.Text, "3h before") {
+		t.Fatalf("explainer = %q, want a 3-hour lead-in named as \"3h before\"", w.explainer.Text)
+	}
+	if strings.Contains(w.explainer.Text, "180") {
+		t.Fatalf("explainer = %q, must not spell a 3-hour lead-in as a bare minute count", w.explainer.Text)
 	}
 
-	_, err := w.stateFromForm()
-	if err == nil {
-		t.Fatal("stateFromForm must reject a 1500-minute lead-in, matching the widget's own validator")
+	w.offsetEntry.SetText("02:30")
+	if !strings.Contains(w.explainer.Text, "2h 30m before") {
+		t.Fatalf("explainer = %q, want a 150-minute lead-in named as \"2h 30m before\"", w.explainer.Text)
+	}
+}
+
+// The same wording rule applies to the settled ("Arm again to run at ...") and
+// armed ("Runs at ...") sentences, which are separate format strings.
+func TestWindowSettledAndArmedExplainersNameTheLeadInInHours(t *testing.T) {
+	w := newTestWindow(t)
+
+	w.timeEntry.SetText("12:00")
+	w.offsetEntry.SetText("03:00")
+	w.Apply(app.Event{
+		Status: app.StatusDone,
+		Now:    time.Now(),
+		Result: runner.Result{Text: "Hello!", CostUSD: 0.0044, Duration: 3 * time.Second},
+	})
+	if !strings.Contains(w.explainer.Text, "3h before") {
+		t.Fatalf("settled explainer = %q, want the lead-in named as \"3h before\"", w.explainer.Text)
+	}
+
+	w.Apply(app.Event{
+		Status:    app.StatusArmed,
+		Now:       time.Date(2026, 7, 14, 9, 0, 0, 0, time.Local),
+		FireAt:    time.Date(2026, 7, 14, 9, 0, 0, 0, time.Local),
+		Target:    time.Date(2026, 7, 14, 12, 0, 0, 0, time.Local),
+		Remaining: 3 * time.Hour,
+	})
+	if !strings.Contains(w.explainer.Text, "3h before") {
+		t.Fatalf("armed explainer = %q, want the lead-in named as \"3h before\"", w.explainer.Text)
 	}
 }
 

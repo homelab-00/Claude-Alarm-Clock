@@ -9,6 +9,11 @@ calling a release done.
 Verify on a real desktop session — these do not work over SSH without a
 display, and several need a live D-Bus session.
 
+Both form fields are typed as zero-padded `HH:MM`. Where a step below asks
+for a "1-minute lead-in", type `00:01` into **Run this early** — a bare `1`
+is rejected, because `1` alone cannot say whether you mean an hour or a
+minute.
+
 ## 1. The tray icon actually appears
 
 ```bash

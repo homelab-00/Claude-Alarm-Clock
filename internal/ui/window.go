@@ -3,7 +3,6 @@ package ui
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -123,10 +122,13 @@ func NewWindow(core *app.Core) *Window {
 	// disagreeing about the same input.
 	w.timeEntry.Validator = timeValidator
 
+	// The lead-in wears the same HH:MM face as the target time above it: a
+	// three-hour lead-in reads "03:00", not "180". See leadin.go for why that
+	// also makes the field's bounds enforce themselves.
 	w.offsetEntry = widget.NewEntry()
-	w.offsetEntry.SetPlaceHolder("minutes")
-	w.offsetEntry.SetText(strconv.Itoa(int(st.Spec.Offset / time.Minute)))
-	w.offsetEntry.Validator = minutesValidator
+	w.offsetEntry.SetPlaceHolder("HH:MM")
+	w.offsetEntry.SetText(formatLeadIn(st.Spec.Offset))
+	w.offsetEntry.Validator = leadInValidator
 
 	// The hero/explainer must track the form live, as the user types --
 	// this sentence is the only place the two fields' relationship is
@@ -408,13 +410,12 @@ func (w *Window) formFireTime() (fire, target time.Time, offset time.Duration, e
 		return time.Time{}, time.Time{}, 0, errors.New("Target time must be HH:MM, e.g. 07:30")
 	}
 
-	// minutesValidator is the single source of truth for the offset field --
-	// see the identical reasoning in stateFromForm.
-	if verr := minutesValidator(w.offsetEntry.Text); verr != nil {
-		return time.Time{}, time.Time{}, 0, fmt.Errorf("Run this early %s", verr)
+	// parseLeadIn is the single source of truth for the offset field -- see
+	// the identical reasoning in stateFromForm.
+	offset, oerr := parseLeadIn(w.offsetEntry.Text)
+	if oerr != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("Run this early %s", oerr)
 	}
-	mins, _ := strconv.Atoi(w.offsetEntry.Text) // minutesValidator already confirmed this parses
-	offset = time.Duration(mins) * time.Minute
 
 	spec := schedule.Spec{Hour: hour, Minute: minute, Offset: offset}
 	fire, target, ferr := spec.FireAt(time.Now())
@@ -435,8 +436,8 @@ func idleExplainer(fire, target time.Time, offset time.Duration) string {
 		return fmt.Sprintf("Claude Code will run at %s — exactly at your target (in %s)",
 			fire.Format("15:04"), in)
 	}
-	return fmt.Sprintf("Claude Code will run at %s — %d min before your %s target (in %s)",
-		fire.Format("15:04"), int(offset/time.Minute), target.Format("15:04"), in)
+	return fmt.Sprintf("Claude Code will run at %s — %s before your %s target (in %s)",
+		fire.Format("15:04"), inDuration(offset), target.Format("15:04"), in)
 }
 
 // rearmExplainer is the sentence shown once a run has settled (Done, Missed, or
@@ -448,8 +449,8 @@ func rearmExplainer(fire, target time.Time, offset time.Duration) string {
 		return fmt.Sprintf("Arm again to run at %s, exactly at your target.",
 			fire.Format("15:04"))
 	}
-	return fmt.Sprintf("Arm again to run at %s — %d min before your %s target.",
-		fire.Format("15:04"), int(offset/time.Minute), target.Format("15:04"))
+	return fmt.Sprintf("Arm again to run at %s — %s before your %s target.",
+		fire.Format("15:04"), inDuration(offset), target.Format("15:04"))
 }
 
 // armedExplainer is the plain-language sentence while Armed. Unlike
@@ -461,14 +462,19 @@ func armedExplainer(fireAt, target time.Time) string {
 	if offset <= 0 {
 		return fmt.Sprintf("Runs at %s — exactly at your target", fireAt.Format("15:04"))
 	}
-	return fmt.Sprintf("Runs at %s — %d min before your %s target",
-		fireAt.Format("15:04"), int(offset/time.Minute), target.Format("15:04"))
+	return fmt.Sprintf("Runs at %s — %s before your %s target",
+		fireAt.Format("15:04"), inDuration(offset), target.Format("15:04"))
 }
 
-// inDuration formats a duration for the explainer's "(in ...)" suffix, e.g.
-// "11h 35m" or "45m". Unlike humanDur (used for the status line's "ago"/
-// "fires in" phrasing elsewhere), this always keeps a space between the
-// hour and minute components, matching the sentence it sits inside.
+// inDuration formats a duration for prose, e.g. "11h 35m" or "45m". Both
+// durations in the explainer use it: the lead-in ("3h before your 12:00
+// target") and the "(in ...)" suffix. Unlike humanDur (used for the status
+// line's "ago"/"fires in" phrasing elsewhere), this always keeps a space
+// between the hour and minute components, matching the sentence it sits
+// inside.
+//
+// The lead-in is entered as "03:00" but described here as "3h": the field is a
+// duration you type, the sentence is one you read.
 func inDuration(d time.Duration) string {
 	if d < 0 {
 		d = 0
@@ -536,20 +542,22 @@ func (w *Window) stateFromForm() (config.State, error) {
 		return config.State{}, err
 	}
 
-	// minutesValidator is the single source of truth for the offset field, for
-	// the same reason timeValidator is for the time field above: if
-	// stateFromForm re-derived its own rules and they drifted from the
-	// widget's validator (as they did before this fix -- the widget enforced
-	// an upper bound of 24h that this method did not), the field could show
-	// "valid" for input Arm then rejects, with two different error messages.
-	if err := minutesValidator(w.offsetEntry.Text); err != nil {
+	// parseLeadIn is the single source of truth for the offset field, for the
+	// same reason timeValidator is for the time field above: if stateFromForm
+	// re-derived its own rules and they drifted from the widget's validator (as
+	// they did before this fix -- the widget enforced an upper bound of 24h
+	// that this method did not), the field could show "valid" for input Arm
+	// then rejects, with two different error messages. Parsing and validating
+	// in one call, rather than validating and then re-parsing, is what makes
+	// that drift impossible rather than merely absent.
+	offset, err := parseLeadIn(w.offsetEntry.Text)
+	if err != nil {
 		return config.State{}, fmt.Errorf("lead-in %s", err)
 	}
-	mins, _ := strconv.Atoi(w.offsetEntry.Text) // minutesValidator already confirmed this parses
 
 	st.Spec.Hour = hour
 	st.Spec.Minute = minute
-	st.Spec.Offset = time.Duration(mins) * time.Minute
+	st.Spec.Offset = offset
 	st.WorkDir = w.workDirEnt.Text
 	st.Model = w.modelEntry.Text
 	st.Prompt = w.promptEntry.Text
@@ -570,20 +578,6 @@ func (w *Window) fail(err error) {
 func timeValidator(s string) error {
 	_, _, err := schedule.ParseHHMM(s)
 	return err
-}
-
-func minutesValidator(s string) error {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return fmt.Errorf("must be a whole number of minutes")
-	}
-	if n < 0 {
-		return fmt.Errorf("cannot be negative")
-	}
-	if n >= 24*60 {
-		return fmt.Errorf("must be less than 24 hours")
-	}
-	return nil
 }
 
 // roundDur trims a duration to something a human wants to read.
