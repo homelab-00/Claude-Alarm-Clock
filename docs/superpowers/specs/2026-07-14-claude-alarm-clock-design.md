@@ -180,8 +180,7 @@ it correct when the offset straddles a DST boundary.
 ### 5.2 The poll loop
 
 A 1-second `time.Ticker` re-reads `time.Now()` and compares wall clock to wall
-clock. Measured cost: 0.007% of one core. It also gives the tray tooltip a live
-countdown for free.
+clock. Measured cost: 0.007% of one core.
 
 Both operands get `.Round(0)` to strip the monotonic reading before comparison.
 This is subtle and essential: without it, `Before()` uses the monotonic readings
@@ -192,9 +191,37 @@ Suspend and NTP steps are detected in the same loop: when the wall-clock delta
 and the monotonic delta between two ticks diverge by more than a couple of tick
 periods, the machine slept or the clock was stepped.
 
-`FireAt` is recomputed on: app start, every detected time jump, and after every
-fire. That single rule makes the design self-healing against suspend, NTP steps,
-DST, and timezone changes.
+`FireAt` is recomputed on **app start** (see `Restore`, §5.3) and after every
+fire. It is deliberately **not** recomputed on a detected time jump.
+
+> **Correction (2026-07-14, during implementation).** This section originally
+> said `FireAt` was also recomputed on every detected time jump, "making the
+> design self-healing". That was wrong, and it directly contradicted §5.3.
+>
+> After a laptop sleeps past the fire time, recomputing from the `Spec` yields
+> *tomorrow's* occurrence — so the alarm silently re-arms and the user is never
+> told they missed it. That violates §2 ("one-shot; it never silently
+> reschedules") and defeats the grace window entirely.
+>
+> Recompute-on-jump also buys nothing:
+> - **Suspend** does not invalidate `FireAt`. It is an absolute instant, and it
+>   is still the correct one; `Decide` handles it (fire, or missed).
+> - **DST** is already resolved at computation time — `time.Date` applies the
+>   UTC offset in effect *at the target date*, so an alarm armed before a
+>   changeover for a date after it is correct when computed.
+> - **A timezone change produces no clock jump at all** (the instant does not
+>   move), so `DetectJump` never observes it. Recompute-on-jump could not have
+>   fixed the TZ case even in principle. A TZ change while armed keeps the
+>   original absolute instant; it is re-resolved from the `Spec` on the next
+>   arm or restart. This is a documented limitation, not a bug.
+>
+> It only helped a rare NTP-step edge case, at the cost of the behaviour the
+> user explicitly chose. Removed.
+
+`EventJump` is therefore **informational**: it tells the UI the wall clock moved,
+and it is what the poll loop uses to explain a large gap between ticks. It does
+not mutate the alarm. Because `Core` no longer touches the alarm on a jump, there
+is nothing for the alarm's own tick evaluation to race against.
 
 ### 5.3 Firing rules
 
@@ -203,7 +230,9 @@ Let `now` be the wall clock at a tick, `fire` the computed alarm instant.
 - `now < fire` → tick; update countdown.
 - `fire <= now <= fire + Grace` → **fire**. Run Claude. Then disarm.
 - `now > fire + Grace` → **do not run.** Enter `MISSED` state, show how late it
-  was, disarm. Offer "Run now" and "Re-arm" buttons.
+  was, disarm. Offer a "Run now" button; the Arm button (now reading "Arm"
+  again, since the alarm disarmed itself) doubles as the way to re-arm for
+  the next occurrence -- there is no separate "Re-arm" button.
 
 **The grace window governs unobserved time only.** It answers exactly one
 question: "the app was not watching (suspended, or not running) — is this alarm
@@ -358,8 +387,10 @@ pane. The Arm button is `widget.HighImportance`, switching to
 `widget.DangerImportance` when armed.
 
 In the `MISSED` state (§5.3) the status area additionally shows how late the
-alarm was, plus two buttons: **Run now** (invoke Claude immediately) and
-**Re-arm** (recompute for the next occurrence).
+alarm was, plus a **Run now** button (invoke Claude immediately). There is no
+separate "Re-arm" button: MISSED already disarmed the alarm, so the Arm button
+has reverted to reading "Arm", and pressing it re-arms for the next
+occurrence.
 
 Working directory, model, and prompt live in a collapsed `widget.Accordion`
 labelled "Advanced", so the default view stays clean but nothing is hardcoded.
@@ -426,8 +457,14 @@ Documented in `MANUAL-TESTS.md`:
 2. Never `fyne.App.ScheduleNotification` — `time.AfterFunc` underneath.
 3. `.Round(0)` **both** operands before comparing.
 4. `time.Local` is cached for the process lifetime. Store an IANA zone name.
-5. Recompute `FireAt` on start, on time-jump, after every fire.
-6. Fire exactly once: the poller returns after firing; superseded generations are dropped.
+5. Recompute `FireAt` on start and after every fire — **never on a time jump.**
+   Recomputing on a jump silently re-arms a missed alarm for tomorrow instead of
+   reporting it MISSED, which is the opposite of what §5.3 requires. See §5.2.
+6. `EventJump` is informational. It must not mutate the alarm. A jump handler
+   that re-arms is racing the alarm's own evaluation of the same tick.
+7. Fire exactly once. Guard the fire/missed path with a compare-and-clear
+   (`disarmIfStill`), not an unconditional disarm: the user may re-arm in the
+   window between the loop deciding and the loop clearing.
 
 **Fyne**
 7. `SetCloseIntercept` + `w.Hide()` is the only thing keeping a tray app alive.

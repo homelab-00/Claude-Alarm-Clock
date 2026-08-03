@@ -1,0 +1,434 @@
+// Package app orchestrates the alarm, the runner, and the store.
+//
+// It must never import Fyne. It emits Events; internal/ui is the only thing
+// that renders them.
+package app
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"claudealarm/internal/config"
+	"claudealarm/internal/runner"
+	"claudealarm/internal/schedule"
+)
+
+// Status is what the app is doing.
+type Status int
+
+const (
+	StatusIdle    Status = iota // disarmed, nothing to report
+	StatusArmed                 // counting down
+	StatusRunning               // claude is running right now
+	StatusDone                  // claude answered
+	StatusMissed                // the fire time passed unobserved, beyond grace
+	StatusError                 // claude failed
+)
+
+func (s Status) String() string {
+	switch s {
+	case StatusIdle:
+		return "idle"
+	case StatusArmed:
+		return "armed"
+	case StatusRunning:
+		return "running"
+	case StatusDone:
+		return "done"
+	case StatusMissed:
+		return "missed"
+	case StatusError:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
+
+// Event is one thing the UI needs to render.
+type Event struct {
+	Status Status
+	Now    time.Time
+
+	// ClockOnly marks a tick whose only meaningful field is Now: the clock
+	// face must keep advancing every second, including for the entire
+	// duration of a run and after a terminal status (Done/Missed/Error),
+	// but a tick must never clobber a terminal status/result with the
+	// zeroed-out fields a bare tick carries. The UI updates the clock
+	// unconditionally and otherwise ignores a ClockOnly event.
+	ClockOnly bool
+
+	FireAt    time.Time
+	Target    time.Time
+	Remaining time.Duration // StatusArmed: until FireAt
+	Late      time.Duration // StatusMissed: how far past FireAt we woke
+
+	Result runner.Result // StatusDone
+	Err    error         // StatusError
+}
+
+// Core wires the three seams together.
+type Core struct {
+	clk    schedule.Clock
+	alarm  *schedule.Alarm
+	runner runner.Runner
+	store  config.Store
+
+	out chan Event
+
+	mu      sync.Mutex
+	state   config.State
+	status  Status
+	running bool            // guards fire(); see tryBeginRun/endRun
+	ctx     context.Context // set by Run; bounds the blocking terminal-event sends below
+}
+
+// New returns a Core. Call Run in a goroutine, and run the Alarm too.
+func New(clk schedule.Clock, al *schedule.Alarm, r runner.Runner, st config.Store) *Core {
+	loaded, err := st.Load()
+	if err != nil {
+		log.Printf("app: failed to load persisted state, falling back to defaults: %v", err)
+		loaded = config.DefaultState(".")
+	}
+	return &Core{
+		clk:    clk,
+		alarm:  al,
+		runner: r,
+		store:  st,
+		out:    make(chan Event, 8),
+		state:  loaded,
+		status: StatusIdle,
+	}
+}
+
+// Events is the stream the UI renders. Buffered, and Core never blocks on it:
+// a slow UI drops ticks rather than stalling the alarm.
+func (c *Core) Events() <-chan Event { return c.out }
+
+// State returns the current persisted settings.
+func (c *Core) State() config.State {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
+// Arm schedules the alarm. This is an EXPLICIT user act.
+//
+// Per spec 5.3, the grace window is NOT consulted here. Grace answers "the app
+// was not watching -- is this stale?", which is meaningless when the user is
+// sitting in front of the app pressing the button. So if the computed fire time
+// is already in the past but the target is still ahead (arming an 07:30 target
+// with a 20-minute lead-in at 07:20), we fire immediately, however far past the
+// fire time we are.
+func (c *Core) Arm(st config.State) error {
+	if err := st.Validate(); err != nil {
+		return err
+	}
+	if err := st.ValidateWorkDir(); err != nil {
+		return err
+	}
+	// Resolve claude now, at arm time, so a missing binary fails while the user
+	// is looking at the app -- not at fire time, when nobody is.
+	if _, err := runner.Lookup(); err != nil {
+		return err
+	}
+
+	now := c.clk.Now()
+	fire, target, err := st.Spec.FireAt(now)
+	if err != nil {
+		return err
+	}
+
+	st.Armed = true
+	st.FireAt = fire
+	st.Target = target
+
+	c.mu.Lock()
+	c.state = st
+	c.mu.Unlock()
+
+	if err := c.store.Save(st); err != nil {
+		return fmt.Errorf("could not save settings: %w", err)
+	}
+
+	// The fire time is already gone, but the target is not. Fire now, ignoring
+	// grace -- see the doc comment.
+	if !now.Round(0).Before(fire.Round(0)) {
+		c.alarm.Disarm()
+		// Every other path that decides to fire persists the disarm before
+		// firing (see EventFire and Restore's DecideFire below). This path
+		// must too: without it, Armed=true and a stale FireAt survive in
+		// preferences.json, so a restart within the grace window re-fires
+		// an alarm that already ran, and any later restart reports a false
+		// MISSED for one that succeeded.
+		c.disarmAndPersist()
+		go c.fire(context.Background(), fire, target)
+		return nil
+	}
+
+	c.alarm.Arm(fire, target, st.Spec.Grace)
+	c.emit(Event{Status: StatusArmed, Now: now, FireAt: fire, Target: target, Remaining: fire.Sub(now)})
+	return nil
+}
+
+// Restore re-arms a persisted alarm after a restart.
+//
+// Unlike Arm, this represents time the app was NOT watching, so the grace
+// window DOES apply. An alarm that came due while the app was shut down and is
+// now hours stale must be reported missed, not fired.
+func (c *Core) Restore() error {
+	st, err := c.store.Load()
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	c.state = st
+	c.mu.Unlock()
+
+	if !st.Armed || st.FireAt.IsZero() {
+		c.setStatus(StatusIdle)
+		c.emit(Event{Status: StatusIdle, Now: c.clk.Now()})
+		return nil
+	}
+
+	now := c.clk.Now()
+
+	switch schedule.Decide(now, st.FireAt, st.Spec.Grace) {
+	case schedule.DecideMissed:
+		c.disarmAndPersist()
+		c.setStatus(StatusMissed)
+		c.emitBlocking(Event{
+			Status: StatusMissed, Now: now,
+			FireAt: st.FireAt, Target: st.Target,
+			Late: now.Round(0).Sub(st.FireAt.Round(0)),
+		})
+
+	case schedule.DecideFire:
+		c.disarmAndPersist()
+		go c.fire(context.Background(), st.FireAt, st.Target)
+
+	case schedule.DecideWait:
+		c.alarm.Arm(st.FireAt, st.Target, st.Spec.Grace)
+		c.setStatus(StatusArmed)
+		c.emit(Event{
+			Status: StatusArmed, Now: now,
+			FireAt: st.FireAt, Target: st.Target,
+			Remaining: st.FireAt.Sub(now),
+		})
+	}
+	return nil
+}
+
+// Disarm cancels a pending alarm.
+func (c *Core) Disarm() {
+	c.alarm.Disarm()
+	c.disarmAndPersist()
+	c.setStatus(StatusIdle)
+	c.emit(Event{Status: StatusIdle, Now: c.clk.Now()})
+}
+
+// RunNow invokes claude immediately, ignoring the schedule entirely. This backs
+// the "Run now" button offered in the MISSED state.
+func (c *Core) RunNow() {
+	go c.fire(context.Background(), time.Time{}, time.Time{})
+}
+
+// Run consumes the alarm's updates. It blocks until ctx is cancelled.
+func (c *Core) Run(ctx context.Context) {
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case u := <-c.alarm.Updates():
+			switch u.Kind {
+			case schedule.EventJump:
+				// The wall clock moved behind our back (suspend, or an NTP
+				// step). This is purely informational: fireAt is an absolute
+				// instant and is unaffected by the jump, so Alarm.Run already
+				// evaluates Decide against it correctly on this same tick
+				// (fire within grace, MISSED beyond it, handled below via
+				// EventFire/EventMissed). Core must not mutate the alarm here
+				// -- see the design doc §5.2/§5.3 and the correction therein.
+
+			case schedule.EventTick:
+				if armed, _, _ := c.alarm.Armed(); armed {
+					c.emit(Event{
+						Status: StatusArmed, Now: u.Now,
+						FireAt: u.FireAt, Target: u.Target, Remaining: u.Remaining,
+					})
+				} else {
+					// Not armed: idle, running, or resting on a terminal
+					// status (Done/Missed/Error) after firing. The clock is
+					// the app's headline widget and must keep advancing in
+					// every one of those states -- including for the whole
+					// duration of a run, up to 120s -- or it reads as a
+					// hung app. ClockOnly tells the UI to move the clock
+					// and touch nothing else, so a tick can never clobber a
+					// terminal status/result with its own zeroed-out
+					// fields.
+					c.emit(Event{Status: c.currentStatus(), Now: u.Now, ClockOnly: true})
+				}
+
+			case schedule.EventFire:
+				c.disarmAndPersist()
+				go c.fire(ctx, u.FireAt, u.Target)
+
+			case schedule.EventMissed:
+				c.disarmAndPersist()
+				c.setStatus(StatusMissed)
+				c.emitBlocking(Event{
+					Status: StatusMissed, Now: u.Now,
+					FireAt: u.FireAt, Target: u.Target, Late: u.Late,
+				})
+			}
+		}
+	}
+}
+
+// fire runs claude and reports the outcome.
+//
+// Guarded by tryBeginRun/endRun so two overlapping calls -- most plausibly a
+// double-click on "Run now", or an alarm firing while a manual run is still
+// in flight -- can never spawn two concurrent, separately billed Claude
+// invocations. Every fire path (Arm's immediate-fire branch, Restore,
+// EventFire, RunNow) goes through here, so the guard protects all of them
+// uniformly.
+func (c *Core) fire(ctx context.Context, fireAt, target time.Time) {
+	if !c.tryBeginRun() {
+		log.Printf("app: fire() called while a run was already in flight; ignoring")
+		return
+	}
+	defer c.endRun()
+
+	st := c.State()
+
+	bin, err := runner.Lookup()
+	if err != nil {
+		c.setStatus(StatusError)
+		c.emitBlocking(Event{Status: StatusError, Now: c.clk.Now(), Err: err})
+		return
+	}
+
+	c.setStatus(StatusRunning)
+	c.emit(Event{Status: StatusRunning, Now: c.clk.Now(), FireAt: fireAt, Target: target})
+
+	res, err := c.runner.Run(ctx, runner.Config{
+		Bin:       bin,
+		WorkDir:   st.WorkDir,
+		Model:     st.Model,
+		Prompt:    st.Prompt,
+		BudgetUSD: runner.DefaultBudgetUSD,
+		Timeout:   runner.DefaultTimeout,
+	})
+	if err != nil {
+		c.setStatus(StatusError)
+		c.emitBlocking(Event{Status: StatusError, Now: c.clk.Now(), FireAt: fireAt, Target: target, Err: err})
+		return
+	}
+
+	c.setStatus(StatusDone)
+	c.emitBlocking(Event{Status: StatusDone, Now: c.clk.Now(), FireAt: fireAt, Target: target, Result: res})
+}
+
+func (c *Core) disarmAndPersist() {
+	c.mu.Lock()
+	c.state.Armed = false
+	c.state.FireAt = time.Time{}
+	c.state.Target = time.Time{}
+	st := c.state
+	c.mu.Unlock()
+	if err := c.store.Save(st); err != nil {
+		log.Printf("app: failed to persist disarm: %v", err)
+	}
+}
+
+// tryBeginRun claims the exclusive right to invoke Claude. It reports false if
+// a run is already in flight.
+//
+// Every path into fire() goes through here: the Run-now button, Arm's
+// immediate-fire branch, EventFire, and Restore's DecideFire. Two concurrent
+// invocations would be two separately-billed API calls, and two racing
+// StatusRunning->StatusDone sequences whose results would fight over the UI.
+func (c *Core) tryBeginRun() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running {
+		return false
+	}
+	c.running = true
+	return true
+}
+
+// endRun releases the claim taken by tryBeginRun, so a later fire (the alarm,
+// or another press of Run now) is free to proceed. Must run via defer
+// immediately after a successful tryBeginRun -- see fire -- so the claim is
+// never left latched after a run ends, however it ends.
+func (c *Core) endRun() {
+	c.mu.Lock()
+	c.running = false
+	c.mu.Unlock()
+}
+
+func (c *Core) setStatus(s Status) {
+	c.mu.Lock()
+	c.status = s
+	c.mu.Unlock()
+}
+
+func (c *Core) currentStatus() Status {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status
+}
+
+// emit never blocks. A slow UI drops a tick; it must never stall the alarm.
+func (c *Core) emit(e Event) {
+	select {
+	case c.out <- e:
+	default:
+	}
+}
+
+// emitBlocking sends a terminal event (StatusDone, StatusError, StatusMissed)
+// and waits for room in the channel if there isn't any.
+//
+// Dropping a tick costs nothing -- another follows in a second. Dropping a
+// terminal event costs the user the only record of it: config.State has no
+// field for a runner.Result, so a dropped StatusDone silently discards the
+// answer the alarm ran for, with no way to recover it. So these three
+// statuses block instead of dropping.
+//
+// The wait is bounded by Core's own context, not by the caller's: a wedged
+// UI must eventually be freed by process shutdown (ctx cancelled), but it
+// must not be able to free itself early by, say, cancelling the fire's own
+// per-run context while the result is still in flight. If Run has not been
+// called yet -- ctx is nil -- there is nothing to bound the wait with and
+// nothing that could ever cancel it, so we fall back to the non-blocking
+// send rather than risk hanging forever.
+func (c *Core) emitBlocking(e Event) {
+	ctx := c.runContext()
+	if ctx == nil {
+		c.emit(e)
+		return
+	}
+	select {
+	case c.out <- e:
+	case <-ctx.Done():
+	}
+}
+
+// runContext returns the context Run was started with, or nil if Run has not
+// been called yet.
+func (c *Core) runContext() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ctx
+}

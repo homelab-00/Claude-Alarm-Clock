@@ -1,0 +1,24 @@
+[Details]
+Name = "Claude Alarm Clock"
+ID = "gr.polaris.claudealarm"
+Version = "1.0.0"
+Build = 1
+Icon = "assets/icon.png"
+
+# Declares that this app has been migrated to Fyne's fyne.Do threading model.
+#
+# This is not cosmetic. When it is absent, Fyne installs a safety net: a widget
+# touched from a foreign goroutine is logged AND silently repaired via
+# fyne.DoAndWait (internal/async/goroutine.go). When it is present, Fyne runs
+# the call directly on whatever goroutine you are on -- no log, no repair.
+#
+# Declaring it is honest here: internal/ui/bridge.go is the only caller of
+# fyne.Do in the codebase and the sole crossing point between the Core's
+# goroutine and any widget; Window spawns no goroutines; and the whole test
+# suite ran with Fyne's checker enabled and reported zero violations. Fyne v2.9
+# removes the net by default regardless.
+#
+# The authoritative guard remains `go test -race`, which catches real data races
+# whether or not Fyne is logging them.
+[Migrations]
+fyneDo = true
