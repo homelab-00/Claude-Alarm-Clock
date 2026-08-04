@@ -1,5 +1,6 @@
 # Binaries
 /alarmclock
+/alarmclock.linkcheck
 *.exe
 *.so
 *.dylib
@@ -12,6 +13,10 @@ coverage.*
 # Fyne packaging output
 /fyne-cross/
 *.tar.xz
+/dist/
+/stage/
+/AppDir/
+/linuxdeploy-x86_64.AppImage
 
 # Editor / OS
 .idea/

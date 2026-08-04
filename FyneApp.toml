@@ -5,6 +5,19 @@ Version = "1.0.0"
 Build = 1
 Icon = "assets/icon.png"
 
+# appimagetool hard-aborts with ".desktop file is missing a Categories= key"
+# if this section is absent, because Fyne's .desktop template only emits
+# Categories when [LinuxAndBSD] provides it. The AppImage build depends on it.
+#
+# WARNING: `fyne package` REWRITES this file in place -- it re-serialises the
+# whole thing, stripping every comment including this one, and increments
+# Build. scripts/package-linux.sh restores it afterwards. If you run
+# `fyne package` by hand, run `git checkout -- FyneApp.toml` after.
+[LinuxAndBSD]
+Categories = ["Utility"]
+GenericName = "Alarm Clock"
+Comment = "Runs Claude Code at a chosen time"
+
 # Declares that this app has been migrated to Fyne's fyne.Do threading model.
 #
 # This is not cosmetic. When it is absent, Fyne installs a safety net: a widget

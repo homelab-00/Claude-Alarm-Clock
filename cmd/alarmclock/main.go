@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"fyne.io/fyne/v2"
 	fyneapp "fyne.io/fyne/v2/app"
 
 	"claudealarm/internal/app"
+	"claudealarm/internal/buildinfo"
 	"claudealarm/internal/config"
 	"claudealarm/internal/runner"
 	"claudealarm/internal/schedule"
@@ -32,9 +34,33 @@ import (
 // clock and loses time across a suspend.
 const tickPeriod = time.Second
 
+// version is injected at link time by the release workflow:
+//
+//	go build -ldflags "-X main.version=$GITHUB_REF_NAME"
+//
+// It must remain an UNINITIALISED package-level string. The linker's -X is
+// only effective on a string variable that is uninitialised or initialised to
+// a constant expression; if this ever becomes a const, a struct field, or is
+// initialised by a function call, -X silently does nothing and every release
+// reports "dev".
+//
+// The symbol the linker looks for is literally "main.version". The module path
+// (claudealarm) is not part of it.
+var version string
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	hidden := flag.Bool("hidden", false, "start minimised to the tray")
 	flag.Parse()
+
+	// Before any Fyne initialisation. -version has to work with no display,
+	// because the release workflow runs it as the smoke test that proves the
+	// linker actually injected the tag.
+	if *showVersion {
+		bi, ok := debug.ReadBuildInfo()
+		fmt.Println("Claude Alarm Clock " + buildinfo.String(buildinfo.Resolve(version, bi, ok)))
+		return
+	}
 
 	a := fyneapp.NewWithID("gr.polaris.claudealarm") // the ID is required for Preferences()
 	a.SetIcon(ui.Icon)
