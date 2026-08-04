@@ -30,8 +30,17 @@ jobs:
       # The suite is headless: no display, no network, no API spend. It uses
       # Fyne's software test driver and shell-script stand-ins for the claude
       # CLI, so it needs nothing beyond the build dependencies above.
+      #
+      # `set -o pipefail` is required here: GitHub's default runner shell is
+      # `bash -e {0}`, with no `-o pipefail`, so without it the exit status of
+      # `tee` (always 0) would win over `go test`'s and this step would report
+      # success on a genuine test failure or even a compile error. Confirmed
+      # against a real run: a race-flaked `go test` failure left this step
+      # green until this line was added.
       - name: Test
-        run: go test -race -cover ./... 2>&1 | tee test.log
+        run: |
+          set -o pipefail
+          go test -race -cover ./... 2>&1 | tee test.log
 
       # This string means a widget was touched from a goroutine other than the
       # Fyne one without going through fyne.Do. Fyne v2.8 repairs and logs it;
