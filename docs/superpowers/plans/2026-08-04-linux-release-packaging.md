@@ -689,9 +689,19 @@ FYNE_ARCHIVE="Claude Alarm Clock.tar.xz"   # named from Details.Name, with space
 TARBALL="claude-alarm-clock-${VERSION}-linux-amd64.tar.xz"
 
 # `fyne package` rewrites FyneApp.toml in place: it re-serialises the file,
-# stripping every comment, and increments Build. Restore it however this script
-# exits, so a failure halfway through does not leave the tree mutated.
-restore_toml() { git checkout -- FyneApp.toml 2>/dev/null || true; }
+# stripping every comment, reordering keys, and incrementing Build. Restore it
+# however this script exits, so a failure halfway through does not leave the
+# file mutated.
+#
+# Restore from a byte copy, NOT from `git checkout -- FyneApp.toml`. Those are
+# not the same thing: git restores the INDEX state, so if the file carries
+# uncommitted edits when the script runs, a git-based restore silently discards
+# the user's work along with fyne's damage. This was hit for real during Task 3.
+# A copy restores exactly what was there, and needs no .git at all -- which also
+# makes the script work from an unpacked source tarball.
+TOML_BACKUP="$(mktemp)"
+cp FyneApp.toml "${TOML_BACKUP}"
+restore_toml() { cp "${TOML_BACKUP}" FyneApp.toml; rm -f "${TOML_BACKUP}"; }
 trap restore_toml EXIT
 
 rm -rf dist stage AppDir
@@ -781,6 +791,21 @@ Expected:
 git status --porcelain FyneApp.toml
 ```
 Expected: empty. The trap ran even though the script succeeded.
+
+Now the case a git-based restore would have got wrong — uncommitted local edits
+must survive the packaging run:
+
+```bash
+printf '\n# scratch edit that must survive packaging\n' >> FyneApp.toml
+scripts/package-linux.sh 0.0.0
+grep -c "scratch edit that must survive packaging" FyneApp.toml
+```
+Expected: `1`. The edit is still there. A `git checkout --` restore would have
+destroyed it. Clean up afterwards:
+
+```bash
+git checkout -- FyneApp.toml && git status --porcelain FyneApp.toml
+```
 
 Now prove it also fires on failure. `GLIBC_2.0` is an absurdly low ceiling that
 any real binary exceeds, so this forces the assertion to trip:
@@ -1328,8 +1353,12 @@ Change `## Build` to `## Build from source` and append to it:
 ```markdown
 `scripts/package-linux.sh <version>` builds both release artifacts locally into
 `dist/`. Note that `fyne package` **rewrites `FyneApp.toml` in place**, stripping
-every comment and incrementing `Build`; the script restores it via a trap, but
-if you invoke `fyne package` by hand, run `git checkout -- FyneApp.toml` after.
+every comment, reordering keys and incrementing `Build`. The script takes a copy
+first and restores it on exit, so running the script is safe even with
+uncommitted edits in that file. If you invoke `fyne package` by hand, restore the
+file yourself — and be aware that `git checkout -- FyneApp.toml` will also throw
+away any uncommitted edits you had, since it restores the index, not the state
+the file was in a moment earlier.
 ```
 
 - [ ] **Step 3: Verify the version numbers are consistent**
