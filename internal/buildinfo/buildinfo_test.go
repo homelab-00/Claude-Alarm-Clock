@@ -75,6 +75,9 @@ func TestResolveInjectedSurvivesMissingBuildInfo(t *testing.T) {
 	}
 }
 
+// VCS metadata from the toolchain must survive even when an injected version
+// is present, so bug reports from modified checkouts can be correctly traced
+// to the exact commit that was built.
 func TestResolveReadsRevisionAndModified(t *testing.T) {
 	got := Resolve("v1.4.0", stamp("v1.4.0", "f0d1965abcdef", true), true)
 
@@ -105,6 +108,8 @@ func TestStringKeepsShortRevision(t *testing.T) {
 	}
 }
 
+// When no revision was available at build time, the output must be clean
+// and not include empty parentheses or other noise.
 func TestStringOmitsEmptyRevision(t *testing.T) {
 	got := String(Info{Version: "dev"})
 
@@ -120,5 +125,48 @@ func TestStringMarksModified(t *testing.T) {
 
 	if got != "v1.4.0 (f0d1965) (modified)" {
 		t.Fatalf("String = %q, want %q", got, "v1.4.0 (f0d1965) (modified)")
+	}
+}
+
+// The truncation boundary must be exact: a 7-character revision is the limit
+// and must not be sliced. This is the default git abbreviation length.
+func TestStringBoundaryAtSevenChars(t *testing.T) {
+	got := String(Info{Version: "v1.4.0", Revision: "f0d1965"})
+
+	if got != "v1.4.0 (f0d1965)" {
+		t.Fatalf("String = %q, want %q", got, "v1.4.0 (f0d1965)")
+	}
+}
+
+// The "(devel)" sentinel means VCS stamping was unavailable, so the version
+// must fall back to DefaultVersion. However, if revision and modified were
+// somehow set in the same build (unlikely but possible), they must propagate.
+func TestResolveDevelFallsBackButPreservesMetadata(t *testing.T) {
+	got := Resolve("", stamp("(devel)", "abc1234def567", true), true)
+
+	if got.Version != DefaultVersion {
+		t.Fatalf("Version = %q, want %q", got.Version, DefaultVersion)
+	}
+	if got.Revision != "abc1234def567" {
+		t.Fatalf("Revision = %q, want %q", got.Revision, "abc1234def567")
+	}
+	if !got.Modified {
+		t.Fatal("Modified = false, want true")
+	}
+}
+
+// A GOPATH-mode build or no injected version with an empty toolchain version
+// still produces a usable default, but revision and modified must survive.
+func TestResolveEmptyMainVersionWithMetadata(t *testing.T) {
+	got := Resolve("", stamp("", "def567abc1234", true), true)
+
+	if got.Version != DefaultVersion {
+		t.Fatalf("Version = %q, want %q", got.Version, DefaultVersion)
+	}
+	if got.Revision != "def567abc1234" {
+		t.Fatalf("Revision = %q, want %q", got.Revision, "def567abc1234")
+	}
+	if !got.Modified {
+		t.Fatal("Modified = false, want true")
 	}
 }
