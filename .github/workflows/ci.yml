@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Fyne's GLFW/OpenGL backend needs cgo and these headers. None are
+      # preinstalled on any runner image.
+      - name: Install Fyne build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+
+      # The suite is headless: no display, no network, no API spend. It uses
+      # Fyne's software test driver and shell-script stand-ins for the claude
+      # CLI, so it needs nothing beyond the build dependencies above.
+      - name: Test
+        run: go test -race -cover ./... 2>&1 | tee test.log
+
+      # This string means a widget was touched from a goroutine other than the
+      # Fyne one without going through fyne.Do. Fyne v2.8 repairs and logs it;
+      # v2.9 turns it into a crash. It must never appear.
+      - name: Assert no Fyne threading violations
+        run: |
+          if grep -q "Error in Fyne call thread" test.log; then
+            echo "::error::a widget was touched outside the Fyne goroutine"
+            exit 1
+          fi
+          echo "OK: no threading violations"
+
+  package-smoke:
+    # Runs the REAL packaging path on every push, so the release workflow is
+    # never the first thing to discover a break. Publishes nothing.
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04
+    env:
+      CGO_ENABLED: "1"
+      DEBIAN_FRONTEND: noninteractive
+      MAX_GLIBC: GLIBC_2.35
+    steps:
+      # Before checkout: the base image has no git, curl or CA certificates,
+      # and there is no sudo.
+      - name: Install toolchain and Fyne build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates xz-utils file binutils \
+            libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+
+      - uses: actions/checkout@v7
+
+      - name: Mark the workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install the fyne CLI
+        run: |
+          go install fyne.io/tools/cmd/fyne@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # 0.0.0 rather than a pre-release string: fyne's --app-version accepts
+      # only integers and dots up to x.y.z.
+      - name: Package
+        run: scripts/package-linux.sh 0.0.0 "$GITHUB_RUN_NUMBER"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: smoke-artifacts
+          path: dist/
+          retention-days: 7
