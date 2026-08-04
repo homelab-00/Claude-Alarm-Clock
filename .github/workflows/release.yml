@@ -1,0 +1,82 @@
+name: release
+
+# Tags only. Defining just `tags:` is what stops this running on branch pushes.
+# The pattern deliberately excludes pre-release suffixes: fyne's --app-version
+# accepts only integers and dots.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04
+    permissions:
+      # Minimal and sufficient: creates the release AND uploads the assets.
+      # Every unlisted scope is implicitly none.
+      contents: write
+    env:
+      CGO_ENABLED: "1"
+      DEBIAN_FRONTEND: noninteractive
+      MAX_GLIBC: GLIBC_2.35
+    steps:
+      - name: Install toolchain and Fyne build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates xz-utils file binutils \
+            libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+
+      - uses: actions/checkout@v7
+
+      - name: Mark the workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install the fyne CLI
+        run: |
+          go install fyne.io/tools/cmd/fyne@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # The v strip is mandatory, not cosmetic: --app-version evaluates
+      # semver.IsValid("v" + arg), so "v1.2.3" becomes "vv1.2.3" and fails.
+      # The binary still gets the tag verbatim, via TAG.
+      - name: Derive the version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/package-linux.sh "${{ steps.v.outputs.version }}" "$GITHUB_RUN_NUMBER"
+
+      # gh is preinstalled on hosted runners but not in the container image.
+      - name: Install gh
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update && apt-get install -y gh
+
+      # First-party, so there is no third-party action SHA to pin.
+      # --verify-tag refuses to publish if the tag does not exist on the remote.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            "dist/claude-alarm-clock-${VERSION}-linux-amd64.tar.xz" \
+            "dist/claude-alarm-clock-${VERSION}-x86_64.AppImage" \
+            dist/SHA256SUMS
