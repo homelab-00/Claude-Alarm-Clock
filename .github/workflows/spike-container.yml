@@ -1,0 +1,53 @@
+name: spike-container
+
+# Manual only. This workflow is a one-off experiment and is deleted once it
+# has answered its question.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CGO_ENABLED: "1"
+    steps:
+      # First, before checkout: the base image has no git, no curl and no CA
+      # certificates, and actions/checkout needs git to do a real clone rather
+      # than silently degrading to a tarball download. There is no sudo here.
+      - name: Install toolchain and Fyne build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates xz-utils file binutils \
+            libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+
+      - uses: actions/checkout@v7
+
+      # The checkout is owned by a different uid than the one the steps run as,
+      # which makes git refuse to operate on it and breaks Go's VCS stamping.
+      - name: Mark the workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Report the environment
+        run: |
+          echo "--- glibc ---"
+          ldd --version | head -1
+          echo "--- go ---"
+          go version
+          echo "--- git ---"
+          git --version
+          git log --oneline -1
+          echo "--- cgo build ---"
+          go build -o /tmp/probe ./cmd/alarmclock
+          echo "--- glibc floor of the produced binary ---"
+          objdump -T /tmp/probe | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
