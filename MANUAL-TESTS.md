@@ -145,8 +145,9 @@ and different bundled libraries, so it cannot answer these questions.
       Claude run completes and the answer is shown.
 - [ ] `./claude-alarm-clock-<v>-x86_64.AppImage -version` prints the release
       tag, not `dev`.
-- [ ] Extract the tar.xz and `sudo make install`. The app appears in the
-      application menu with its icon. `sudo make uninstall` removes it cleanly.
+- [ ] Extract the tar.xz, `cd alarmclock`, and `sudo make install`. The app
+      appears in the application menu with its icon. `sudo make uninstall`
+      removes it cleanly.
 - [ ] `make user-install` works without root and puts the entry in
       `~/.local/share/applications`.
 - [ ] `ldd` on the installed binary: `libGL`, `libX11` and `libxkbcommon`

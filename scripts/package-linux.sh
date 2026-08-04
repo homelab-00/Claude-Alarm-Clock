@@ -181,6 +181,81 @@ if ! grep -q '^Categories=' "${DESKTOP}"; then
   exit 1
 fi
 
+echo "==> Patching the shipped Makefile's Icon variable"
+# Upstream bug, fyne.io/tools@v1.7.2 (cmd/fyne/internal/commands/package-unix.go):
+# the pixmap is written to disk as `appIDOrName + filepath.Ext(icon)` -- here
+# "${APP_ID}.png" -- but the Makefile template it emits sets Icon to the bare
+# appIDOrName, with NO extension. `install` and `user-install` then try to
+# `install` a file that does not exist and fail outright; `uninstall` and
+# `user-uninstall` only look like they still work because their `rm` lines
+# are prefixed with `-`, which tells make to ignore the failure -- they
+# silently no-op against the wrong path instead of removing anything.
+#
+# Do NOT "fix" this by renaming the .png to the extension-less name instead.
+# The .desktop's Icon=gr.polaris.claudealarm is correct as written: freedesktop
+# icon-theme lookup resolves a bare Icon= name to a file with an extension
+# somewhere on the icon path, so installing the .png under its real name is
+# the right behaviour. The Makefile's Icon variable is simply wrong, and this
+# patches only that.
+MAKEFILE="stage/${BINARY}/Makefile"
+PIXMAP_DIR="stage/${BINARY}/usr/local/share/pixmaps"
+PIXMAP_FILE="$(find "${PIXMAP_DIR}" -maxdepth 1 -type f -name "${APP_ID}.*" -printf '%f\n')"
+if [ -z "${PIXMAP_FILE}" ]; then
+  echo "ERROR: no file matching ${APP_ID}.* found in ${PIXMAP_DIR}." >&2
+  echo "       fyne package's output layout may have changed; nothing to point the Makefile's Icon at." >&2
+  exit 1
+fi
+if [ "$(wc -l <<<"${PIXMAP_FILE}")" -ne 1 ]; then
+  echo "ERROR: expected exactly one file matching ${APP_ID}.* in ${PIXMAP_DIR}, found:" >&2
+  echo "${PIXMAP_FILE}" >&2
+  exit 1
+fi
+sed -i "s/^Icon := \"${APP_ID}\"\$/Icon := \"${PIXMAP_FILE}\"/" "${MAKEFILE}"
+if ! grep -qF "Icon := \"${PIXMAP_FILE}\"" "${MAKEFILE}"; then
+  echo "ERROR: failed to patch Icon in ${MAKEFILE} -- fyne's Makefile template may have changed." >&2
+  exit 1
+fi
+
+echo "==> Repacking the corrected tar.xz"
+# Same name, format and internal directory structure fyne produced -- the
+# Makefile's bytes are the only thing that differ from what it wrote.
+rm -f "dist/${TARBALL}"
+( cd stage && tar -Jcf "../dist/${TARBALL}" "${BINARY}" )
+
+echo "==> Asserting the packaged Makefile actually installs (regression guard)"
+# This exact check was missing, which is how a Makefile that fails on
+# `install` shipped in the first place: everything else here builds and
+# smoke-tests the binary and the AppImage, but nothing had ever run the
+# Makefile itself. Run it for real, into a scratch DESTDIR, and assert the
+# three files it promises actually land. Revert the Icon patch above and
+# this must fail -- a check that passes either way is worse than no check.
+(
+  set -euo pipefail
+  D="$(mktemp -d)"
+  trap 'rm -rf "${D}"' EXIT
+  make -C "stage/${BINARY}" DESTDIR="${D}" install
+  test -f "${D}/usr/bin/${BINARY}"
+  test -f "${D}/usr/share/applications/${APP_ID}.desktop"
+  test -f "${D}/usr/share/pixmaps/${PIXMAP_FILE}"
+)
+echo "    OK: install lands the binary, the .desktop entry and the icon"
+
+echo "==> Asserting 'make user-install' too (fake HOME, never the real one)"
+# HOME is set as a make command-line override, which the Makefile's own
+# $(HOME) references take verbatim -- it is never exported to this shell's
+# environment, so nothing outside the scratch directory below is touched,
+# including the sed rewrite of the installed .desktop's Exec= line.
+(
+  set -euo pipefail
+  D="$(mktemp -d)"
+  trap 'rm -rf "${D}"' EXIT
+  make -C "stage/${BINARY}" HOME="${D}" user-install
+  test -f "${D}/.local/bin/${BINARY}"
+  test -f "${D}/.local/share/applications/${APP_ID}.desktop"
+  test -f "${D}/.local/share/icons/${PIXMAP_FILE}"
+)
+echo "    OK: user-install lands the binary, the .desktop entry and the icon"
+
 echo "==> Fetching linuxdeploy"
 # One download suffices: linuxdeploy's continuous AppImage already bundles
 # linuxdeploy-plugin-appimage, appimagetool, mksquashfs and
