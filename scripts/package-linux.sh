@@ -99,6 +99,12 @@ echo "==> Asserting -X main.version=${TAG} reached the go build invocation"
 # a cached, up-to-date target and prints only "touch alarmclock" instead of
 # the link line -- silently defeating this whole check. A distinct,
 # never-created path forces the full plan to print every time.
+#
+# Remove any stale ${BINARY}.linkcheck first: if a file already sits at that
+# path with a matching build ID, `go build -n` reports IT as up to date too,
+# printing "touch alarmclock.linkcheck" instead of the link line -- the exact
+# bug this distinct path was chosen to avoid, just one build cycle later.
+rm -f "${BINARY}.linkcheck"
 LINK_PLAN="$(CGO_ENABLED=1 go build -n -trimpath -ldflags "${LDFLAGS}" -o "${BINARY}.linkcheck" ./cmd/alarmclock 2>&1)"
 if ! grep -qF -- "-X main.version=${TAG}" <<<"${LINK_PLAN}"; then
   echo "ERROR: -X main.version=${TAG} never reached a go build/link invocation." >&2
@@ -174,6 +180,65 @@ if ! grep -q '^Categories=' "${DESKTOP}"; then
   echo "       appimagetool will refuse it. Add [LinuxAndBSD] Categories to FyneApp.toml." >&2
   exit 1
 fi
+
+echo "==> Fetching linuxdeploy"
+# One download suffices: linuxdeploy's continuous AppImage already bundles
+# linuxdeploy-plugin-appimage, appimagetool, mksquashfs and
+# desktop-file-validate. No apt install of squashfs-tools or desktop-file-utils.
+if [ ! -x linuxdeploy-x86_64.AppImage ]; then
+  curl -fsSL -o linuxdeploy-x86_64.AppImage \
+    https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+  chmod +x linuxdeploy-x86_64.AppImage
+fi
+
+echo "==> Building AppImage"
+# APPIMAGE_EXTRACT_AND_RUN must be an ENVIRONMENT VARIABLE, not the
+# --appimage-extract-and-run flag: linuxdeploy spawns the bundled appimagetool
+# as a child process, and only the environment propagates to that nested call.
+#
+# The fyne tree is NOT a valid AppDir -- it uses a usr/local/ prefix, while
+# linuxdeploy expects usr/bin and usr/share. Hand it the three pieces instead,
+# so both artifacts carry byte-identical metadata.
+#
+# Never pass -l: it force-deploys and bypasses the excludelist. Let linuxdeploy
+# skip the graphics stack; it logs "Skipping deployment of blacklisted library".
+P="stage/${BINARY}/usr/local"
+APPIMAGE="claude-alarm-clock-${VERSION}-x86_64.AppImage"
+
+APPIMAGE_EXTRACT_AND_RUN=1 \
+ARCH=x86_64 \
+LINUXDEPLOY_OUTPUT_VERSION="${VERSION}" \
+LDAI_OUTPUT="dist/${APPIMAGE}" \
+./linuxdeploy-x86_64.AppImage \
+  --appdir AppDir \
+  --executable   "${P}/bin/${BINARY}" \
+  --desktop-file "${P}/share/applications/${APP_ID}.desktop" \
+  --icon-file    "${P}/share/pixmaps/${APP_ID}.png" \
+  --output appimage
+
+echo "==> Asserting the graphics stack was not bundled"
+# The entire point of the exercise. A bundled libGL built against this
+# machine's Mesa breaks the app on every NVIDIA machine, and a bundled glibc
+# breaks it everywhere. Cheap to check, catches an excludelist regression.
+if [ -d AppDir/usr/lib ]; then
+  ls -1 AppDir/usr/lib/
+  if ls -1 AppDir/usr/lib/ | grep -Ei \
+    '^(libGL\.|libEGL\.|libGLX\.|libGLdispatch\.|libOpenGL\.|libX11\.|libxcb\.|libdrm\.|libglapi\.|libgbm\.|libwayland-client\.|libc\.so|ld-linux)'; then
+    echo "ERROR: driver or glibc libraries leaked into the AppDir." >&2
+    echo "       The AppImage would break on any machine with a different GPU stack." >&2
+    exit 1
+  fi
+fi
+echo "    OK: no GL/X11/driver/glibc libraries bundled"
+
+echo "==> Smoke-testing the AppImage"
+APPIMAGE_EXTRACT_AND_RUN=1 "dist/${APPIMAGE}" -version
+
+echo "==> Generating SHA256SUMS"
+# Generated from inside dist/ with bare globs so the file contains BASENAMES.
+# `sha256sum "$PWD"/dist/*` would bake in runner paths, still exit 0 on the
+# builder, and fail for every real downloader.
+( cd dist && sha256sum claude-alarm-clock-* > SHA256SUMS && sha256sum -c SHA256SUMS )
 
 echo "==> dist/"
 ls -la dist/

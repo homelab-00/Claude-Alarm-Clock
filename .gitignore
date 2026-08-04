@@ -1,5 +1,6 @@
 # Binaries
 /alarmclock
+/alarmclock.linkcheck
 *.exe
 *.so
 *.dylib
