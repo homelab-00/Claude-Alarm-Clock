@@ -199,6 +199,8 @@ git commit -m "ci: remove container spike, assumption proven"
 git push
 ```
 
+**Outcome:** The container route (`container: image: ubuntu:22.04` on `runs-on: ubuntu-24.04`, with `actions/checkout@v7` and `actions/setup-go@v7`) was proven — no docker-run fallback was needed. `ldd --version` reported `2.35` and `go build ./cmd/alarmclock` succeeded with `CGO_ENABLED=1`, but the produced binary's actual glibc floor (`objdump -T | grep GLIBC | sort -uV | tail -1`) was **`GLIBC_2.34`**, not the expected `GLIBC_2.35` — later tasks must assert against `GLIBC_2.34`. `workflow_dispatch` alone could not trigger the run since GitHub only registers manually-dispatchable workflows that exist on the default branch; a temporary `push` trigger scoped to `feat/linux-release-packaging` was added to observe the run (see run [30947943280](https://github.com/homelab-00/Claude-Alarm-Clock/actions/runs/30947943280)).
+
 ---
 
 ### Task 2: The `-version` flag
