@@ -6,7 +6,75 @@ prompt, and shows you the answer. It lives in the system tray and keeps
 running when you close the window, so the alarm survives even if you never
 look at it again until it fires.
 
-## Build
+## Requirements
+
+**The `claude` CLI must be on your `PATH`.** This app is a scheduler around
+Claude Code, not a replacement for it — at fire time it execs `claude` and
+shows you the answer. Without it the app starts and reports the problem at
+startup rather than at 07:10 when nobody is watching.
+
+Built for **glibc 2.35 and newer**: Ubuntu 22.04 and newer, Debian 12 and
+newer, current Fedora, Arch and every rolling distribution. Older systems —
+RHEL/Rocky/Alma 9, Ubuntu 20.04, Debian 11 — are not supported.
+
+(Do not claim the app "will not start" on those. As measured on 2026-08-04 the
+binary's actual symbol floor is `GLIBC_2.34`, below the container's 2.35, so
+some of them may work by accident. Promising 2.35 is what the build
+environment guarantees; promising less would be a claim CI does not enforce,
+and the floor can rise at any time.)
+
+x86_64 only.
+
+## Install
+
+### AppImage
+
+```bash
+chmod +x claude-alarm-clock-1.0.0-x86_64.AppImage
+./claude-alarm-clock-1.0.0-x86_64.AppImage
+```
+
+`libfuse2` is **not** required. The bundled AppImage runtime is statically
+linked against libfuse3, so nothing needs installing alongside it — only the
+kernel FUSE module and the standard setuid `fusermount3` helper, both present
+by default on mainstream desktops. Where FUSE is genuinely unavailable
+(containers, hardened kernels), run it without mounting:
+
+```bash
+./claude-alarm-clock-1.0.0-x86_64.AppImage --appimage-extract-and-run
+```
+
+The AppImage deliberately does **not** bundle glibc or the graphics stack
+(libGL, libEGL, libX11, libxcb, libdrm, Mesa). Those always come from your
+system, so it works on Mesa and NVIDIA alike.
+
+### tar.xz
+
+Installs a desktop entry and icon, so the app appears in your application menu
+and can be autostarted with `-hidden`.
+
+```bash
+tar -xJf claude-alarm-clock-1.0.0-linux-amd64.tar.xz
+cd alarmclock
+sudo make install      # /usr/local/{bin,share/applications,share/pixmaps}
+```
+
+Or without root:
+
+```bash
+make user-install      # ~/.local/{bin,share/applications,share/icons}
+```
+
+`make uninstall` and `make user-uninstall` reverse either. The Makefile honours
+`PREFIX=` and `DESTDIR=` for packagers.
+
+### Verifying a download
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+## Build from source
 
 You need Go 1.26 or later (developed and tested against 1.26.5),
 `CGO_ENABLED=1` (Fyne's GLFW/OpenGL backend requires cgo), and the `claude`
@@ -21,6 +89,15 @@ go build -o alarmclock ./cmd/alarmclock
 
 `CGO_ENABLED=1` is Go's default when a C toolchain is present, so you
 shouldn't need to set it explicitly unless your environment overrides it.
+
+`scripts/package-linux.sh <version>` builds both release artifacts locally into
+`dist/`. Note that `fyne package` **rewrites `FyneApp.toml` in place**, stripping
+every comment, reordering keys and incrementing `Build`. The script takes a copy
+first and restores it on exit, so running the script is safe even with
+uncommitted edits in that file. If you invoke `fyne package` by hand, restore the
+file yourself — and be aware that `git checkout -- FyneApp.toml` will also throw
+away any uncommitted edits you had, since it restores the index, not the state
+the file was in a moment earlier.
 
 ## Run
 
@@ -149,9 +226,15 @@ Per-package coverage as measured on this branch:
 | `cmd/alarmclock` | 0.0% (wiring only, exercised manually) |
 
 The alarm math, the suspend/NTP-jump detection, the Claude invocation, and
-the app orchestration are all behind interfaces (`Clock`, `Runner`, `Store`)
-and run headlessly with no display, no network, and no API spend. The Claude
-exec path is tested against shell-script stand-ins under
+the app orchestration run headlessly with no display, no network, and no API
+spend, and mostly sit behind interfaces (`Clock`, `Runner`, `Store`) — except
+that `internal/app/core.go`'s `Arm` and `fire` both resolve the `claude`
+binary via the package-level `runner.Lookup()`, a hardcoded
+`exec.LookPath("claude")` that bypasses the injected `Runner`. It is only
+ever resolved there, never executed, but `go test ./...` still needs
+*something* named `claude` on your `PATH` to satisfy it — a clone without
+Claude Code installed will fail here with `claude not found on PATH`. The
+Claude exec path itself is tested against shell-script stand-ins under
 `internal/runner/testdata/` rather than the real CLI. `internal/ui` uses
 Fyne's software test driver (`fyne.io/fyne/v2/test`), which is still
 headless but does exercise real widget code.
