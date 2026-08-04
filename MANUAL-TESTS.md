@@ -130,3 +130,43 @@ go test -race ./... 2>&1 | grep 'Error in Fyne call thread'
 Any hit means a widget was mutated from a goroutine other than Fyne's own
 without going through `fyne.Do` — Fyne v2.8 currently logs and silently
 repairs this, but v2.9 turns it into a crash.
+
+## Release artifacts
+
+Run these against the artifacts **CI produced**, downloaded from the release
+page — never against a local build. A local build has a different glibc floor
+and different bundled libraries, so it cannot answer these questions.
+
+- [ ] Download all three assets and run `sha256sum -c SHA256SUMS` in a fresh
+      directory. Expect two `OK` lines and no path errors.
+- [ ] `chmod +x` the AppImage and run it. The window appears.
+- [ ] The tray icon appears (KDE Plasma 6 is the verified environment).
+- [ ] Arm an alarm two minutes out with a short lead-in and let it fire. The
+      Claude run completes and the answer is shown.
+- [ ] `./claude-alarm-clock-<v>-x86_64.AppImage -version` prints the release
+      tag, not `dev`.
+- [ ] Extract the tar.xz and `sudo make install`. The app appears in the
+      application menu with its icon. `sudo make uninstall` removes it cleanly.
+- [ ] `make user-install` works without root and puts the entry in
+      `~/.local/share/applications`.
+- [ ] `ldd` on the installed binary: `libGL`, `libX11` and `libxkbcommon`
+      resolve to system paths under `/usr/lib`, never to a bundled copy.
+
+**If the release job fails partway, check for a stray draft release before
+re-running it.** `gh release create` with assets attached is not one API
+call — per its own `--help`, it creates the release as a **draft**, uploads
+each asset, then publishes. A network blip on the runner during the upload
+step aborts the job with that draft left behind, still sitting on the tag.
+
+Re-running the job then fails immediately: `gh release create` refuses a
+tag that already has a release object, draft or not (`a release with the
+same tag name already exists`). Check for it and clear it first:
+
+```bash
+gh release view <tag> --json isDraft,name   # look for "isDraft": true
+gh release delete <tag> --yes               # removes the stray draft only
+```
+
+Do not add `--cleanup-tag` here — the git tag was pushed for real and is
+what triggered the run; only the release object the failed run created is
+stray.
