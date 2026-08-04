@@ -15,7 +15,7 @@
 Every task's requirements implicitly include this section.
 
 - **Architecture:** x86_64 only. No arm64 anywhere.
-- **glibc floor:** `GLIBC_2.35`. Set by building inside `container: ubuntu:22.04`.
+- **glibc ceiling:** `GLIBC_2.35`, guaranteed by building inside `container: ubuntu:22.04`, and what the README promises. The assertion is `floor <= GLIBC_2.35`, **never an equality check**. Measured on 2026-08-04 the produced binary's actual floor is `GLIBC_2.34`, because a binary only references the versioned symbols it actually calls — the container's glibc is an upper bound on what the build *can* require, not what it *does*. An equality assertion against either value is wrong: `== 2.35` fails today, and `== 2.34` would fail spuriously the day any dependency touches a 2.35-only symbol, which is a harmless change that must not block a release.
 - **Runner label:** `ubuntu-24.04`, pinned. Never `ubuntu-latest`. Never `ubuntu-22.04` (deprecation begins 2026-09-17).
 - **`--app-version` must receive the version WITHOUT a leading `v`.** It evaluates `semver.IsValid("v" + ver)`, so `v1.2.3` becomes `vv1.2.3` and fails with `invalid --app-version parameter, integer and '.' characters only up to x.y.z`.
 - **`main.version` must stay an uninitialised package-level `string`.** The linker's `-X` is only effective on a string variable that is uninitialised or initialised to a constant expression, and silently does nothing otherwise. The symbol prefix is the literal `main`, never the module path `claudealarm`.
@@ -628,7 +628,7 @@ clean working tree.
   - `dist/claude-alarm-clock-<version>-linux-amd64.tar.xz`
   - the built binary at `./alarmclock`, reused by Task 5
   - CLI contract: `scripts/package-linux.sh <version-without-v> [build-number]`
-  - env contract: `TAG` (default `v<version>`), `EXPECT_GLIBC` (optional, exact match assertion)
+  - env contract: `TAG` (default `v<version>`), `MAX_GLIBC` (optional ceiling; assert floor ≤ this, never equality)
 
 - [ ] **Step 1: Ignore the working directories**
 
@@ -665,9 +665,16 @@ Create `scripts/package-linux.sh`:
 #                 The binary shows the tag verbatim (with the v) because that is
 #                 what a user pastes into a bug report; only fyne and the asset
 #                 filenames use the stripped form.
-#   EXPECT_GLIBC  e.g. "GLIBC_2.35". When set, assert the binary's highest
-#                 required glibc symbol matches EXACTLY. Set in CI, unset
+#   MAX_GLIBC     e.g. "GLIBC_2.35". When set, assert the binary's highest
+#                 required glibc symbol is AT MOST this. Set in CI, unset
 #                 locally (an Arch build legitimately requires a newer glibc).
+#
+#                 A ceiling, never an equality check. The floor is an emergent
+#                 property of which versioned symbols the code happens to call,
+#                 so it sits BELOW the container's glibc (2.34 against a 2.35
+#                 container, measured 2026-08-04) and rises harmlessly whenever
+#                 a dependency starts touching a newer symbol. Only exceeding
+#                 the promise matters.
 #
 set -euo pipefail
 
@@ -706,13 +713,17 @@ case "${ACTUAL}" in
      exit 1 ;;
 esac
 
-if [ -n "${EXPECT_GLIBC:-}" ]; then
-  echo "==> Asserting the glibc floor is ${EXPECT_GLIBC}"
+if [ -n "${MAX_GLIBC:-}" ]; then
+  echo "==> Asserting the glibc floor is at most ${MAX_GLIBC}"
   FLOOR="$(objdump -T "${BINARY}" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
-  echo "    ${FLOOR}"
-  if [ "${FLOOR}" != "${EXPECT_GLIBC}" ]; then
-    echo "ERROR: glibc floor drifted to ${FLOOR}, expected ${EXPECT_GLIBC}." >&2
-    echo "       Users on older distributions would get a 'version not found' loader error." >&2
+  echo "    floor=${FLOOR} ceiling=${MAX_GLIBC}"
+  # sort -V puts the higher version last. If that is not the ceiling, the floor
+  # exceeded it. Equal values sort to the ceiling, so equality passes.
+  HIGHEST="$(printf '%s\n%s\n' "${FLOOR}" "${MAX_GLIBC}" | sort -V | tail -1)"
+  if [ "${HIGHEST}" != "${MAX_GLIBC}" ]; then
+    echo "ERROR: glibc floor ${FLOOR} exceeds the promised ${MAX_GLIBC}." >&2
+    echo "       Users on the distributions the README promises would get a" >&2
+    echo "       'version not found' loader error and the app would not start." >&2
     exit 1
   fi
 fi
@@ -761,7 +772,7 @@ scripts/package-linux.sh 0.0.0
 
 Expected:
 - `-version` line contains `v0.0.0`
-- no glibc assertion (EXPECT_GLIBC unset locally)
+- no glibc assertion (MAX_GLIBC unset locally)
 - `dist/claude-alarm-clock-0.0.0-linux-amd64.tar.xz` exists
 
 - [ ] **Step 5: Verify the trap restored the TOML**
@@ -771,14 +782,22 @@ git status --porcelain FyneApp.toml
 ```
 Expected: empty. The trap ran even though the script succeeded.
 
-Now prove it also fires on failure:
+Now prove it also fires on failure. `GLIBC_2.0` is an absurdly low ceiling that
+any real binary exceeds, so this forces the assertion to trip:
 
 ```bash
-EXPECT_GLIBC=GLIBC_9.99 scripts/package-linux.sh 0.0.0 || true
+MAX_GLIBC=GLIBC_2.0 scripts/package-linux.sh 0.0.0 || true
 git status --porcelain FyneApp.toml
 ```
-Expected: the script exits non-zero with the glibc drift error, and the TOML is
-still clean.
+Expected: the script exits non-zero with `exceeds the promised GLIBC_2.0`, and
+the TOML is still clean.
+
+Then prove the ceiling passes when it should, including the equality case:
+
+```bash
+MAX_GLIBC=GLIBC_2.99 scripts/package-linux.sh 0.0.0 && echo "ceiling OK"
+```
+Expected: success. A ceiling above the floor must not trip.
 
 - [ ] **Step 6: Verify the archive contents**
 
@@ -1009,7 +1028,7 @@ jobs:
     env:
       CGO_ENABLED: "1"
       DEBIAN_FRONTEND: noninteractive
-      EXPECT_GLIBC: GLIBC_2.35
+      MAX_GLIBC: GLIBC_2.35
     steps:
       # Before checkout: the base image has no git, curl or CA certificates,
       # and there is no sudo.
@@ -1057,15 +1076,32 @@ never the first execution of the packaging pipeline."
 git push
 ```
 
-- [ ] **Step 3: Watch the run**
+- [ ] **Step 3: Open a draft PR to trigger the run**
+
+Pushing this branch fires nothing: the triggers are `push` on `main` and
+`pull_request` targeting `main`, and a feature-branch push matches neither.
+Task 1 hit the same class of problem from the other direction — GitHub also
+refuses `workflow_dispatch` for a workflow that does not yet exist on the
+default branch, so adding a dispatch trigger would not help either.
+
+A pull request is the mechanism that runs `ci.yml` before merge, which is
+exactly what it is for. Open it as a draft; Task 10 marks it ready.
+
+```bash
+gh pr create --draft --base main --head feat/linux-release-packaging \
+  --title "Linux release packaging" \
+  --body "Adds AppImage + tar.xz release artifacts. Draft until the packaging path is proven green."
+```
+
+- [ ] **Step 4: Watch the run**
 
 ```bash
 gh run watch "$(gh run list --workflow=ci.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
 Expected: both jobs green. In `package-smoke`, the log shows
-`GLIBC_2.35`, `OK: no GL/X11/driver/glibc libraries bundled`, and
-`SHA256SUMS: OK`.
+`floor=GLIBC_2.34 ceiling=GLIBC_2.35`,
+`OK: no GL/X11/driver/glibc libraries bundled`, and `SHA256SUMS: OK`.
 
 - [ ] **Step 4: Download the smoke artifacts and run them locally**
 
@@ -1122,7 +1158,7 @@ jobs:
     env:
       CGO_ENABLED: "1"
       DEBIAN_FRONTEND: noninteractive
-      EXPECT_GLIBC: GLIBC_2.35
+      MAX_GLIBC: GLIBC_2.35
     steps:
       - name: Install toolchain and Fyne build dependencies
         run: |
@@ -1223,9 +1259,15 @@ Claude Code, not a replacement for it — at fire time it execs `claude` and
 shows you the answer. Without it the app starts and reports the problem at
 startup rather than at 07:10 when nobody is watching.
 
-Built against **glibc 2.35**, which covers Ubuntu 22.04 and newer, Debian 12
-and newer, current Fedora, Arch and every rolling distribution. It will not
-start on RHEL/Rocky/Alma 9 (glibc 2.34) or anything older.
+Built for **glibc 2.35 and newer**: Ubuntu 22.04 and newer, Debian 12 and
+newer, current Fedora, Arch and every rolling distribution. Older systems —
+RHEL/Rocky/Alma 9, Ubuntu 20.04, Debian 11 — are not supported.
+
+(Do not claim the app "will not start" on those. As measured on 2026-08-04 the
+binary's actual symbol floor is `GLIBC_2.34`, below the container's 2.35, so
+some of them may work by accident. Promising 2.35 is what the build
+environment guarantees; promising less would be a claim CI does not enforce,
+and the floor can rise at any time.)
 
 x86_64 only.
 
@@ -1449,6 +1491,8 @@ Task 5. Asset filenames are identical in Tasks 4, 5, 7, 8 and 9.
 1. Action major versions (`@v7`) move. Task 1 surfaces a bad ref immediately.
 2. `linuxdeploy` continuous is unpinned. The AppDir assertion in Task 5 is the
    net.
-3. `ubuntu:22.04` is a moving tag. The `EXPECT_GLIBC` assertion catches drift.
+3. `ubuntu:22.04` is a moving tag. The `MAX_GLIBC` ceiling catches the drift
+   that matters — the tag moving to a base whose glibc exceeds the promise.
+   It deliberately does not catch the floor moving *down*, which is harmless.
 4. `fyne.io/tools/cmd/fyne@latest` is unpinned. If it breaks, pin the version
    in Tasks 6 and 7 together.
