@@ -27,10 +27,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
 
-      # The suite is headless: no display, no network, no API spend. It uses
-      # Fyne's software test driver and shell-script stand-ins for the claude
-      # CLI, so it needs nothing beyond the build dependencies above.
-      #
+      # Core.Arm() calls runner.Lookup(), a hardcoded exec.LookPath("claude")
+      # that is independent of the runner.Fake every test otherwise injects
+      # for the actual invocation -- LookPath just needs *something*
+      # executable named `claude` to resolve, and never runs it. Without
+      # this, every internal/app and internal/ui test that calls Arm() fails
+      # here with "claude not found on PATH" on any runner that doesn't
+      # happen to have the real CLI installed -- i.e. every GitHub-hosted
+      # runner. Confirmed against a real run. This was invisible before this
+      # workflow existed, because it happened to pass on developer machines
+      # with the real CLI already on PATH. The suite itself is otherwise
+      # headless: no display, no network, no API spend -- the real
+      # invocation goes through runner.Fake or, in internal/runner's own
+      # tests, shell-script stand-ins.
+      - name: Provide a stand-in claude on PATH (Arm() only resolves it)
+        run: |
+          mkdir -p "$RUNNER_TEMP/stubbin"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/stubbin/claude"
+          chmod +x "$RUNNER_TEMP/stubbin/claude"
+          echo "$RUNNER_TEMP/stubbin" >> "$GITHUB_PATH"
+
       # `set -o pipefail` is required here: GitHub's default runner shell is
       # `bash -e {0}`, with no `-o pipefail`, so without it the exit status of
       # `tee` (always 0) would win over `go test`'s and this step would report
