@@ -63,6 +63,17 @@ jobs:
       # v2.9 turns it into a crash. It must never appear.
       - name: Assert no Fyne threading violations
         run: |
+          # A missing test.log must fail loudly, not be swallowed by grep's
+          # own "no match" exit status: `grep -q ... test.log` on a nonexistent
+          # file also returns 1, so without this check a missing log and a
+          # clean log are indistinguishable and this step would print its OK
+          # message having checked nothing. Confirmed empirically. Unreachable
+          # today only because this step runs after a successful Test step,
+          # which always creates the file -- do not rely on that staying true.
+          if [ ! -f test.log ]; then
+            echo "::error::test.log not found -- the Test step did not produce it"
+            exit 1
+          fi
           if grep -q "Error in Fyne call thread" test.log; then
             echo "::error::a widget was touched outside the Fyne goroutine"
             exit 1
@@ -70,8 +81,10 @@ jobs:
           echo "OK: no threading violations"
 
   package-smoke:
-    # Runs the REAL packaging path on every push, so the release workflow is
-    # never the first thing to discover a break. Publishes nothing.
+    # Runs the REAL packaging path on push to main and on pull requests
+    # targeting main (this workflow's only two triggers), so the release
+    # workflow is never the first thing to discover a break. A push to a
+    # feature branch alone does not run this job. Publishes nothing.
     runs-on: ubuntu-24.04
     container:
       image: ubuntu:22.04
@@ -98,9 +111,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Pinned, not @latest: scripts/package-linux.sh carries a sed patch for a
+      # Makefile-generation bug specific to fyne.io/tools@v1.7.2 (see that
+      # script's "Patching the shipped Makefile's Icon variable" step). Bumping
+      # this requires re-checking whether that patch is still needed or needs
+      # updating first.
       - name: Install the fyne CLI
         run: |
-          go install fyne.io/tools/cmd/fyne@latest
+          go install fyne.io/tools/cmd/fyne@v1.7.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       # 0.0.0 rather than a pre-release string: fyne's --app-version accepts

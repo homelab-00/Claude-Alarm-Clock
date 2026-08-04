@@ -40,9 +40,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Pinned, not @latest: scripts/package-linux.sh carries a sed patch for a
+      # Makefile-generation bug specific to fyne.io/tools@v1.7.2 (see that
+      # script's "Patching the shipped Makefile's Icon variable" step). Bumping
+      # this requires re-checking whether that patch is still needed or needs
+      # updating first.
       - name: Install the fyne CLI
         run: |
-          go install fyne.io/tools/cmd/fyne@latest
+          go install fyne.io/tools/cmd/fyne@v1.7.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       # The v strip is mandatory, not cosmetic: --app-version evaluates

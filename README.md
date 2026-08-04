@@ -74,41 +74,29 @@ make user-install      # ~/.local/{bin,share/applications,share/icons}
 sha256sum -c SHA256SUMS
 ```
 
-## Build from source
-
-You need Go 1.26 or later (developed and tested against 1.26.5),
-`CGO_ENABLED=1` (Fyne's GLFW/OpenGL backend requires cgo), and the `claude`
-CLI on your `PATH`.
-
-On Arch:
-
-```bash
-sudo pacman -S --needed go libxcursor libxrandr libxinerama libxi libgl mesa
-go build -o alarmclock ./cmd/alarmclock
-```
-
-`CGO_ENABLED=1` is Go's default when a C toolchain is present, so you
-shouldn't need to set it explicitly unless your environment overrides it.
-
-`scripts/package-linux.sh <version>` builds both release artifacts locally into
-`dist/`. Note that `fyne package` **rewrites `FyneApp.toml` in place**, stripping
-every comment, reordering keys and incrementing `Build`. The script takes a copy
-first and restores it on exit, so running the script is safe even with
-uncommitted edits in that file. If you invoke `fyne package` by hand, restore the
-file yourself — and be aware that `git checkout -- FyneApp.toml` will also throw
-away any uncommitted edits you had, since it restores the index, not the state
-the file was in a moment earlier.
-
 ## Run
 
 ```bash
 ./alarmclock            # show the window
 ./alarmclock -hidden    # start minimised to the tray
+./alarmclock -version   # print version information and exit
 ```
 
 `-hidden` is refused (silently downgraded to a visible window) if no system
 tray is available — see "Tray support" below. Starting hidden with no way
 back to the window would strand you with no way to reach the app at all.
+
+`-version` prints the build identity and exits before any Fyne
+initialisation, so it works with no display — which is exactly why the
+release workflow's packaging smoke test runs it, to prove the linker actually
+stamped the right tag into the binary. A release binary reports that tag; a
+plain `go build` from an untagged checkout like this one instead falls back
+to the toolchain's pseudo-version and git revision:
+
+```
+$ ./alarmclock -version
+Claude Alarm Clock v0.0.0-20260804232740-2ebd31237f51 (2ebd312)
+```
 
 ## What it runs
 
@@ -161,6 +149,44 @@ apply when you're the one arming it. If you arm an 07:30 target with a
 minutes in the past — but it fires immediately anyway, however far past the
 fire time you are. Arming is an explicit act performed with you looking at
 the screen, so staleness isn't a meaningful concept there.
+
+## Build from source
+
+You need Go 1.26 or later (developed and tested against 1.26.5),
+`CGO_ENABLED=1` (Fyne's GLFW/OpenGL backend requires cgo), and the `claude`
+CLI on your `PATH`.
+
+On Arch:
+
+```bash
+sudo pacman -S --needed go libxcursor libxrandr libxinerama libxi libgl mesa
+go build -o alarmclock ./cmd/alarmclock
+```
+
+`CGO_ENABLED=1` is Go's default when a C toolchain is present, so you
+shouldn't need to set it explicitly unless your environment overrides it.
+
+Packaging locally with `scripts/package-linux.sh` needs two more things:
+the `fyne` CLI on your `PATH`, at the same pinned version both CI workflows
+install —
+
+```bash
+go install fyne.io/tools/cmd/fyne@v1.7.2
+```
+
+— without which the script fails immediately with `fyne: command not found`;
+and network access, since the script downloads
+`linuxdeploy-x86_64.AppImage` from GitHub on first run (cached in the working
+directory afterwards).
+
+`scripts/package-linux.sh <version>` builds both release artifacts locally into
+`dist/`. Note that `fyne package` **rewrites `FyneApp.toml` in place**, stripping
+every comment, reordering keys and incrementing `Build`. The script takes a copy
+first and restores it on exit, so running the script is safe even with
+uncommitted edits in that file. If you invoke `fyne package` by hand, restore the
+file yourself — and be aware that `git checkout -- FyneApp.toml` will also throw
+away any uncommitted edits you had, since it restores the index, not the state
+the file was in a moment earlier.
 
 ## Known limitation
 
@@ -218,11 +244,12 @@ Per-package coverage as measured on this branch:
 
 | Package | Coverage |
 |---|---|
-| `internal/schedule` | 85.5% |
-| `internal/runner` | 81.8% |
-| `internal/app` | 81.7% |
-| `internal/ui` | 81.0% |
+| `internal/schedule` | 88.4% |
+| `internal/runner` | 87.3% |
+| `internal/app` | 83.7% |
+| `internal/ui` | 87.8% |
 | `internal/config` | 74.5% |
+| `internal/buildinfo` | 100.0% |
 | `cmd/alarmclock` | 0.0% (wiring only, exercised manually) |
 
 The alarm math, the suspend/NTP-jump detection, the Claude invocation, and
