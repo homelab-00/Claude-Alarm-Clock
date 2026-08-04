@@ -2,8 +2,17 @@ name: spike-container
 
 # Manual only. This workflow is a one-off experiment and is deleted once it
 # has answered its question.
+#
+# NOTE: workflow_dispatch alone cannot be invoked here because GitHub only
+# registers manually-dispatchable workflows that exist on the default branch,
+# and this spike is intentionally never merged to main. A push trigger scoped
+# to this feature branch is added so the run can actually be observed; it is
+# removed again with the rest of this file in Step 7.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/linux-release-packaging
 
 permissions:
   contents: read
