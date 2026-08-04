@@ -220,19 +220,52 @@ echo "==> Asserting the graphics stack was not bundled"
 # The entire point of the exercise. A bundled libGL built against this
 # machine's Mesa breaks the app on every NVIDIA machine, and a bundled glibc
 # breaks it everywhere. Cheap to check, catches an excludelist regression.
-if [ -d AppDir/usr/lib ]; then
-  ls -1 AppDir/usr/lib/
-  if ls -1 AppDir/usr/lib/ | grep -Ei \
-    '^(libGL\.|libEGL\.|libGLX\.|libGLdispatch\.|libOpenGL\.|libX11\.|libxcb\.|libdrm\.|libglapi\.|libgbm\.|libwayland-client\.|libc\.so|ld-linux)'; then
-    echo "ERROR: driver or glibc libraries leaked into the AppDir." >&2
-    echo "       The AppImage would break on any machine with a different GPU stack." >&2
-    exit 1
-  fi
+#
+# A missing AppDir/usr/lib means this check could not run at all -- that is
+# NOT the same thing as the check passing. Treat it as a hard failure instead
+# of silently falling through to the "OK" message below (this script has a
+# documented history of assertions that pass against broken implementations;
+# do not add another).
+if [ ! -d AppDir/usr/lib ]; then
+  echo "ERROR: AppDir/usr/lib does not exist -- the excludelist could not be" >&2
+  echo "       verified. linuxdeploy may have changed its output layout, or" >&2
+  echo "       the build above failed silently. A missing directory is not a" >&2
+  echo "       passing check." >&2
+  exit 1
+fi
+
+# Recurse, and match on each entry's basename rather than the raw find
+# output: a forbidden library commonly lands in a subdirectory (e.g. a
+# multiarch-style AppDir/usr/lib/x86_64-linux-gnu/), and a bundled library is
+# frequently a symlink rather than a regular file, so both -type f and
+# -type l must be included. The type tests are grouped in \( \): find's -o
+# binds looser than juxtaposition, so an ungrouped
+# `-type f -o -type l -name ...` would apply any trailing test only to the
+# -type l branch, silently exempting every regular file from it.
+BUNDLED="$(find AppDir/usr/lib \( -type f -o -type l \) -printf '%f\n' | sort -u)"
+echo "${BUNDLED}"
+if grep -Ei \
+  '^(libGL\.|libEGL\.|libGLX\.|libGLdispatch\.|libOpenGL\.|libX11\.|libxcb\.|libdrm\.|libglapi\.|libgbm\.|libwayland-client\.|libc\.so|ld-linux|libm\.so|libresolv\.|libpthread\.|libdl\.so|librt\.so|libnss_)' \
+  <<<"${BUNDLED}"; then
+  echo "ERROR: driver or glibc libraries leaked into the AppDir." >&2
+  echo "       The AppImage would break on any machine with a different GPU stack." >&2
+  exit 1
 fi
 echo "    OK: no GL/X11/driver/glibc libraries bundled"
 
 echo "==> Smoke-testing the AppImage"
-APPIMAGE_EXTRACT_AND_RUN=1 "dist/${APPIMAGE}" -version
+# Mirror the native-binary -version assertion above: an exit status alone
+# does not prove the AppImage reports the right version, only that it ran.
+# A stand-in that runs fine and prints the wrong (or no) version must fail
+# this check exactly as it would fail the binary check above.
+APPIMAGE_ACTUAL="$(APPIMAGE_EXTRACT_AND_RUN=1 "dist/${APPIMAGE}" -version)"
+echo "    ${APPIMAGE_ACTUAL}"
+case "${APPIMAGE_ACTUAL}" in
+  *"${TAG}"*) ;;
+  *) echo "ERROR: AppImage -version reported '${APPIMAGE_ACTUAL}', expected it to contain '${TAG}'." >&2
+     echo "       An AppImage that runs but reports the wrong version is a broken release." >&2
+     exit 1 ;;
+esac
 
 echo "==> Generating SHA256SUMS"
 # Generated from inside dist/ with bare globs so the file contains BASENAMES.
